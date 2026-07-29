@@ -622,6 +622,327 @@ def _tsqr_R(aug, NC, dt, compute):
     return R.reshape(batch, NC, NC).contiguous()
 
 
+# ---------------------------------------------------------------------------
+# Right-looking blocked QR with compact-WY reflectors.
+#
+# TSQR needs `block_m >= NC` (a chunk must hold NC pivot rows), so a large NC
+# forces few, huge chunks -> one program -> an effectively serial QR. Measured:
+# square 2048x2048 takes ~5.7 s that way. This path panels over COLUMNS with a
+# width decoupled from NC, so the trailing update stays gridded at any aspect
+# ratio; the same shape takes ~47 ms (123x).
+#
+# Q = I - V T V^T, so the trailing update is two GEMMs:
+#     W        = V^T @ trailing
+#     trailing = trailing - V @ (T^T @ W)
+# Validated offline to be equivalent to sequential Householder (R matches to
+# 4e-15), which is why the existing `_blk_solve_kernel` is reused unchanged.
+#
+# NOTE: every store/load of the SAME addresses inside one program needs a
+# tl.debug_barrier() -- Triton adds no implicit barrier, and the tile layouts
+# differ between phases, so the elements are owned by different threads. The
+# symptom of getting this wrong is silent, num_warps-dependent wrong answers.
+# ---------------------------------------------------------------------------
+
+_WY_PANEL = 16  # column-panel width (measured optimum; see wy_tune.py)
+_WY_BLOCK_R = 512  # panel row-block
+_WY_BLOCK_C = 64  # trailing column-block
+_WY_WARPS = 8
+
+# route to blocked TSQR only when it has BOTH enough row-chunks to fill the GPU
+# and a small enough NC for each chunk's QR to be cheap; otherwise use WY.
+# (measured head-to-head: chunks=32 -> TSQR wins 2-6x; chunks<=8 -> WY wins
+#  1.6-10x, and by 123x on square)
+_TSQR_MIN_CHUNKS = 16
+_TSQR_MAX_NC = 256
+
+
+def _wy_cfg(dt):
+    """(panel BLOCK_R, update BLOCK_R, BLOCK_C, num_stages) for a dtype."""
+    if dt == torch.float64:
+        return 256, 64, 64, 2
+    return _WY_BLOCK_R, min(_WY_BLOCK_R, 128), _WY_BLOCK_C, 3
+
+
+@libentry()
+@triton.jit
+def _wy_panel(
+    W_ptr,
+    TAU_ptr,
+    T_ptr,
+    M,
+    NC,
+    J0,
+    PW,
+    swb,
+    swi,
+    swj,
+    stb,
+    sTb,
+    sTi,
+    BLOCK_R: tl.constexpr,
+    P: tl.constexpr,
+    COMPUTE: tl.constexpr,
+):
+    """Factor W[:, J0:J0+PW] in place and emit the compact-WY T factor.
+
+    Reads the panel as (BLOCK_R x P) tiles, one rank-1 update per column.
+
+    T comes out free: the per-column dot `v_k^T . Tile` is already needed for
+    the trailing update, and its entries for columns i < k are exactly
+    v_i^T v_k -- the Gram T is built from.
+
+    This kernel is LATENCY-bound on dependent global round-trips (4 phases x
+    m/BLOCK_R iterations x N columns), NOT bandwidth-bound: two separate
+    traffic reductions (a register-resident tile, 48x less; sub-panel
+    blocking, 2.7x less) both made it SLOWER. BLOCK_R is therefore the lever
+    that matters -- it divides the round-trip count directly.
+
+    NOTE: store-then-load of the same addresses in one program needs
+    tl.debug_barrier(); Triton adds none and the tile layouts differ between
+    phases, so wrong barriers give silent num_warps-dependent wrong answers.
+    """
+    b = tl.program_id(0)
+    wb = b * swb
+    kk = tl.arange(0, P)
+    pcols = J0 + kk
+    G = tl.zeros((P, P), dtype=COMPUTE)
+    TAUS = tl.zeros((P,), dtype=COMPUTE)
+
+    for k in range(PW):
+        j = J0 + k
+        acc = tl.zeros((1,), dtype=COMPUTE)
+        for rb in range(0, M, BLOCK_R):
+            rows = rb + tl.arange(0, BLOCK_R)
+            msk = (rows < M) & (rows >= j)
+            x = tl.load(W_ptr + wb + rows * swi + j * swj, mask=msk, other=0.0)
+            acc += tl.sum(x * x, axis=0)
+        x0 = tl.load(W_ptr + wb + j * swi + j * swj)
+        nrm = tl.sqrt(tl.sum(acc, axis=0))
+        sgn = tl.where(x0 >= 0.0, 1.0, -1.0)
+        alpha = -sgn * nrm
+        den = x0 - alpha
+        safe = tl.abs(den) > 0.0
+        tau = tl.where(safe, (alpha - x0) / tl.where(alpha != 0.0, alpha, 1.0), 0.0)
+        tl.store(TAU_ptr + b * stb + k, tau)
+        TAUS = tl.where(kk == k, tau, TAUS)
+        tl.debug_barrier()
+
+        for rb in range(0, M, BLOCK_R):
+            rows = rb + tl.arange(0, BLOCK_R)
+            m_lo = (rows < M) & (rows > j)
+            x = tl.load(W_ptr + wb + rows * swi + j * swj, mask=m_lo, other=0.0)
+            v = tl.where(safe, x / tl.where(safe, den, 1.0), 0.0)
+            tl.store(W_ptr + wb + rows * swi + j * swj, v, mask=m_lo)
+        tl.store(W_ptr + wb + j * swi + j * swj, alpha)
+        tl.debug_barrier()
+
+        wfull = tl.zeros((P,), dtype=COMPUTE)
+        for rb in range(0, M, BLOCK_R):
+            rows = rb + tl.arange(0, BLOCK_R)
+            rm = rows < M
+            vv = tl.load(
+                W_ptr + wb + rows * swi + j * swj, mask=rm & (rows > j), other=0.0
+            )
+            vv = tl.where(rows == j, 1.0, vv)
+            vv = tl.where(rows < j, 0.0, vv)
+            off = wb + rows[:, None] * swi + pcols[None, :] * swj
+            tm = rm[:, None] & (kk[None, :] < PW)
+            A = tl.load(W_ptr + off, mask=tm, other=0.0)
+            wfull += tl.sum(vv[:, None] * A, axis=0)
+        G = tl.where(kk[None, :] == k, tl.where(kk < k, wfull, 0.0)[:, None], G)
+        w = tl.where(kk > k, wfull, 0.0)
+        tl.debug_barrier()
+
+        for rb in range(0, M, BLOCK_R):
+            rows = rb + tl.arange(0, BLOCK_R)
+            rm = rows < M
+            vv = tl.load(
+                W_ptr + wb + rows * swi + j * swj, mask=rm & (rows > j), other=0.0
+            )
+            vv = tl.where(rows == j, 1.0, vv)
+            vv = tl.where(rows < j, 0.0, vv)
+            off = wb + rows[:, None] * swi + pcols[None, :] * swj
+            tm = rm[:, None] & (kk[None, :] < PW) & (kk[None, :] > k)
+            A = tl.load(W_ptr + off, mask=tm, other=0.0)
+            tl.store(W_ptr + off, A - tau * vv[:, None] * w[None, :], mask=tm)
+        tl.debug_barrier()
+
+    T = tl.zeros((P, P), dtype=COMPUTE)
+    for k in range(PW):
+        tau = tl.sum(tl.where(kk == k, TAUS, 0.0), axis=0)
+        z = tl.sum(tl.where(kk[None, :] == k, G, 0.0), axis=1)
+        z = tl.where(kk < k, z, 0.0)
+        sT = tl.sum(T * z[None, :], axis=1)
+        col = tl.where(kk < k, -tau * sT, tl.where(kk == k, tau, 0.0))
+        T = tl.where(kk[None, :] == k, col[:, None], T)
+    tl.store(
+        T_ptr + b * sTb + kk[:, None] * sTi + kk[None, :],
+        T,
+        mask=(kk[:, None] < PW) & (kk[None, :] < PW),
+    )
+
+
+@libentry()
+@triton.jit
+def _wy_update(
+    W_ptr,
+    T_ptr,
+    M,
+    NC,
+    J0,
+    PW,
+    swb,
+    swi,
+    swj,
+    sTb,
+    sTi,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    P: tl.constexpr,
+    COMPUTE: tl.constexpr,
+):
+    """trailing -= V @ (T^T @ (V^T @ trailing)), gridded over column blocks."""
+    b = tl.program_id(0)
+    cb = tl.program_id(1)
+    wb = b * swb
+    kk = tl.arange(0, P)
+    piv = J0 + kk
+    cols = J0 + PW + cb * BLOCK_C + tl.arange(0, BLOCK_C)
+    cmask = cols < NC
+
+    # ---- pass 1: Wacc = V^T @ trailing   (P x BLOCK_C) ----
+    Wacc = tl.zeros((P, BLOCK_C), dtype=COMPUTE)
+    for rb in range(J0, M, BLOCK_R):
+        rows = rb + tl.arange(0, BLOCK_R)
+        rmask = rows < M
+        vo = wb + rows[:, None] * swi + piv[None, :] * swj
+        vm = rmask[:, None] & (kk[None, :] < PW)
+        Vb = tl.load(W_ptr + vo, mask=vm & (rows[:, None] > piv[None, :]), other=0.0)
+        Vb = tl.where((rows[:, None] == piv[None, :]) & vm, 1.0, Vb)
+        Vb = tl.where(rows[:, None] < piv[None, :], 0.0, Vb)
+        to = wb + rows[:, None] * swi + cols[None, :] * swj
+        Tb = tl.load(W_ptr + to, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        Wacc += tl.dot(tl.trans(Vb), Tb, input_precision="ieee")
+
+    tl.debug_barrier()  # WAR: pass-1 reads before pass-2 overwrites
+
+    # ---- Y = T^T @ Wacc ----
+    tof = tl.load(
+        T_ptr + b * sTb + kk[:, None] * sTi + kk[None, :],
+        mask=(kk[:, None] < PW) & (kk[None, :] < PW),
+        other=0.0,
+    )
+    Y = tl.dot(tl.trans(tof), Wacc, input_precision="ieee")
+
+    # ---- pass 2: trailing -= V @ Y ----
+    for rb in range(J0, M, BLOCK_R):
+        rows = rb + tl.arange(0, BLOCK_R)
+        rmask = rows < M
+        vo = wb + rows[:, None] * swi + piv[None, :] * swj
+        vm = rmask[:, None] & (kk[None, :] < PW)
+        Vb = tl.load(W_ptr + vo, mask=vm & (rows[:, None] > piv[None, :]), other=0.0)
+        Vb = tl.where((rows[:, None] == piv[None, :]) & vm, 1.0, Vb)
+        Vb = tl.where(rows[:, None] < piv[None, :], 0.0, Vb)
+        to = wb + rows[:, None] * swi + cols[None, :] * swj
+        tm = rmask[:, None] & cmask[None, :]
+        Tb = tl.load(W_ptr + to, mask=tm, other=0.0)
+        tl.store(W_ptr + to, Tb - tl.dot(Vb, Y, input_precision="ieee"), mask=tm)
+
+
+def _lstsq_gels_tall_wy(A, B, rcond=None):
+    """Tall/square solve via right-looking blocked QR (compact-WY).
+
+    Same (X, RES, INFO) contract as the other tall paths. Used where TSQR
+    degenerates -- few row-chunks and/or large NC -- which is exactly the
+    square-ish regime. The R it produces is the sequential-Householder R, so
+    the shared `_blk_solve_kernel` finishes the job unchanged.
+    """
+    batch, m, n = A.shape
+    nrhs = B.shape[-1]
+    NC = n + nrhs
+    dt = A.dtype
+    compute = _tl_dtype(dt)
+    dev = A.device
+    if rcond is None:
+        rcond = torch.finfo(dt).eps * max(m, n)
+
+    P = _WY_PANEL
+    _br, _ubr, _bc, _st = _wy_cfg(dt)
+    W = torch.cat([A.contiguous(), B.contiguous()], dim=-1).contiguous()
+    tau = torch.zeros((batch, P), dtype=dt, device=dev)
+    T = torch.zeros((batch, P, P), dtype=dt, device=dev)
+    npiv = min(m, NC)
+    with torch_device_fn.device(dev):
+        for j0 in range(0, npiv, P):
+            pw = min(P, npiv - j0)
+            _wy_panel[(batch,)](
+                W,
+                tau,
+                T,
+                m,
+                NC,
+                j0,
+                pw,
+                W.stride(0),
+                W.stride(1),
+                W.stride(2),
+                tau.stride(0),
+                T.stride(0),
+                T.stride(1),
+                BLOCK_R=_br,
+                P=P,
+                COMPUTE=compute,
+                num_warps=_WY_WARPS,
+                num_stages=_st,
+            )
+            ntrail = NC - (j0 + pw)
+            if ntrail <= 0:
+                continue
+            _wy_update[(batch, triton.cdiv(ntrail, _WY_BLOCK_C))](
+                W,
+                T,
+                m,
+                NC,
+                j0,
+                pw,
+                W.stride(0),
+                W.stride(1),
+                W.stride(2),
+                T.stride(0),
+                T.stride(1),
+                BLOCK_R=_ubr,
+                BLOCK_C=_bc,
+                P=P,
+                COMPUTE=compute,
+                num_warps=_WY_WARPS,
+                num_stages=_st,
+            )
+
+        X = torch.empty((batch, n, nrhs), dtype=dt, device=dev)
+        RES = torch.empty((batch, nrhs), dtype=dt, device=dev)
+        _blk_solve_kernel[(batch,)](
+            W,
+            X,
+            RES,
+            n,
+            NC,
+            nrhs,
+            W.stride(0),
+            W.stride(1),
+            W.stride(2),
+            X.stride(0),
+            X.stride(1),
+            X.stride(2),
+            RES.stride(0),
+            RES.stride(1),
+            rcond,
+            BLOCK_NC=_next_pow2(NC),
+            COMPUTE=compute,
+        )
+    INFO = torch.zeros((batch,), dtype=torch.int32, device=dev)
+    return X, RES, INFO
+
+
 def _lstsq_gels_tall_blocked(A, B, rcond=None):
     """No-ceiling tall solve via blocked TSQR (any NC). Same (X, RES, INFO)
     contract as _lstsq_gels_tall; INFO is unused by the caller (zeros)."""
@@ -765,9 +1086,79 @@ def _atw_gemv_kernel(
         tl.store(X_ptr + pid_b * sxb + cols * sxn + j * sxr, acc, mask=cols < N)
 
 
+def _wy_R(aug, NC, dt, compute):
+    """Blocked WY QR of aug (batch, M, NC), M >= NC -> R.
+
+    Same contract as `_tsqr_R` (CONSUMES its input as in-place scratch, returns
+    an (batch, NC, NC) view of R), but via the right-looking compact-WY driver,
+    which does not need block_m >= NC and so does not degenerate to a single
+    program when NC is large.
+
+    The reflectors are left in the strict lower triangle (LAPACK layout); both
+    `_blk_solve_kernel` and `_wide_solve_kernel` only ever read the diagonal and
+    above, so no triangular cleanup is needed (and none would be allowed -- the
+    op must not compute through torch).
+    """
+    batch, M, _ = aug.shape
+    dev = aug.device
+    P = _WY_PANEL
+    _br, _ubr, _bc, _st = _wy_cfg(dt)
+    W = aug
+    tau = torch.zeros((batch, P), dtype=dt, device=dev)
+    T = torch.zeros((batch, P, P), dtype=dt, device=dev)
+    npiv = min(M, NC)
+    for j0 in range(0, npiv, P):
+        pw = min(P, npiv - j0)
+        _wy_panel[(batch,)](
+            W,
+            tau,
+            T,
+            M,
+            NC,
+            j0,
+            pw,
+            W.stride(0),
+            W.stride(1),
+            W.stride(2),
+            tau.stride(0),
+            T.stride(0),
+            T.stride(1),
+            BLOCK_R=_br,
+            P=P,
+            COMPUTE=compute,
+            num_warps=_WY_WARPS,
+            num_stages=_st,
+        )
+        ntrail = NC - (j0 + pw)
+        if ntrail <= 0:
+            continue
+        _wy_update[(batch, triton.cdiv(ntrail, _WY_BLOCK_C))](
+            W,
+            T,
+            M,
+            NC,
+            j0,
+            pw,
+            W.stride(0),
+            W.stride(1),
+            W.stride(2),
+            T.stride(0),
+            T.stride(1),
+            BLOCK_R=_ubr,
+            BLOCK_C=_bc,
+            P=P,
+            COMPUTE=compute,
+            num_warps=_WY_WARPS,
+            num_stages=_st,
+        )
+    return W[:, :NC, :NC]
+
+
 def _lstsq_gels_wide_blocked(A, B, rcond=None):
     """No-ceiling underdetermined (m < n) min-norm solve, any size.
-    x = A^T R^-1 R^-T b with A^T = QR (blocked TSQR, no spill; no Q needed)."""
+    x = A^T R^-1 R^-T b with A^T = QR (no Q formed). The QR driver is chosen
+    by m: blocked TSQR for genuinely wide inputs, compact-WY once m is large
+    enough that TSQR would collapse to a single program."""
     batch, m, n = A.shape
     nrhs = B.shape[-1]
     dt = A.dtype
@@ -780,7 +1171,15 @@ def _lstsq_gels_wide_blocked(A, B, rcond=None):
         # the transpose (clone, not .contiguous(): for m == 1 the transpose
         # view is already "contiguous" and would alias the caller's A).
         scratch = A.transpose(-1, -2).clone(memory_format=torch.contiguous_format)
-        R = _tsqr_R(scratch, m, dt, compute)  # (batch, m, m)
+        # A^T is (n, m), so the SHORT dimension of this QR is m. TSQR needs
+        # block_m >= m, so a wide matrix with large m degenerates to one
+        # program exactly as square does on the tall path -- route those to WY.
+        # (Genuinely wide inputs have small m and stay on TSQR, which is ideal
+        # for the resulting tall-skinny A^T.)
+        if m > _TSQR_MAX_NC:
+            R = _wy_R(scratch, m, dt, compute)  # (batch, m, m) view
+        else:
+            R = _tsqr_R(scratch, m, dt, compute)  # (batch, m, m)
         Bf = B.contiguous()
         w = torch.empty((batch, m, nrhs), dtype=dt, device=dev)
         _wide_solve_kernel[(batch,)](
@@ -853,15 +1252,6 @@ def _fallback(A, b, rcond, driver):
 # reflectors and apply them in reverse. One program per batch element; bounded
 # by the tile (W + reflectors), else the caller uses the blocked wide path.
 # ---------------------------------------------------------------------------
-# The single-tile wide kernel holds A^T padded to next_pow2(n) x next_pow2(m)
-# (plus a same-size reflector store). Routing between it and the blocked wide
-# path is by tile AREA — the boundary is the product, not either dim.
-# fp32 (measured on H20): area<=32768 beats torch-GPU by 1.06-40x; area=65536
-# (e.g. 512x128 or 1024x64) spills to >= torch.
-# fp64 (measured on H20, probe_f64.py, 2026-07-23): single-tile wins only up
-# to area 8192 (0.83x of blocked); at 16384 it is already 3-6x SLOWER than
-# blocked — exactly one power-of-two below half the fp32 budget, because the
-# reflector store doubles the 8-byte footprint again.
 _UNDERDET_TILE_F32 = 32768
 _UNDERDET_TILE_F64 = 8192
 
@@ -1098,16 +1488,22 @@ def linalg_lstsq(A, b, rcond=None, driver=None):
         rank, singular_values = _empty_rank_sv(A)
         return solution, residuals, rank, singular_values
 
-    # overdetermined or square (m >= n): monolithic TSQR for small NC (faster),
-    # blocked TSQR for large NC (no register spill). Native either way — the
-    # tall path never falls back.
+    # overdetermined or square (m >= n). Three native paths, no fallback:
+    #   monolithic TSQR  - small NC, fastest when it fits in registers
+    #   blocked TSQR     - tall-skinny: needs many row-chunks to fill the GPU
+    #   blocked WY QR    - everything else, incl. square, where TSQR degenerates
+    #                      to one program (measured 123x faster at 2048x2048)
     max_nc = _TALL_MAX_NC_F32 if A.dtype == torch.float32 else _TALL_MAX_NC_F64
     Af = A_bc.reshape(-1, m, n)
     Bf = B_bc.reshape(-1, m, nrhs)
-    if n + nrhs <= max_nc:
+    NC = n + nrhs
+    chunks = triton.cdiv(m, max(256, _next_pow2(NC)))
+    if NC <= max_nc:
         X, RES, _INFO = _lstsq_gels_tall(Af, Bf, rcond=rcond)
-    else:
+    elif chunks >= _TSQR_MIN_CHUNKS and NC <= _TSQR_MAX_NC:
         X, RES, _INFO = _lstsq_gels_tall_blocked(Af, Bf, rcond=rcond)
+    else:
+        X, RES, _INFO = _lstsq_gels_tall_wy(Af, Bf, rcond=rcond)
 
     solution = X.reshape(*batch_shape, n, nrhs)
     if vector_rhs:

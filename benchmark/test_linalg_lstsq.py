@@ -37,6 +37,19 @@ class LstsqBenchmark(base.Benchmark):
         (128, 512),
         (8, 64, 1024),
         (16, 32, 2048),
+        # square / near-square -> compact-WY blocked QR. TSQR degenerates here
+        # (block_m >= NC forces a single chunk), so these used to be seconds;
+        # the WY path brings 2048x2048 from ~5.7 s to ~47 ms.
+        (256, 256),
+        (512, 512),
+        (1024, 1024),
+        (2048, 2048),
+        (8, 256, 256),
+        (8, 512, 512),
+        (4096, 512),
+        # underdetermined with large m -> the A^T QR also routes to WY
+        (512, 1024),
+        (1024, 2048),
     ]
 
     def set_more_shapes(self):

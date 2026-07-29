@@ -342,3 +342,85 @@ def test_linalg_lstsq_complex_fallback():
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b)
     assert torch.allclose(res[0], ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.linalg_lstsq
+@pytest.mark.parametrize(
+    "batch,shape",
+    [
+        ((), (256, 256)),  # square -> WY
+        ((), (512, 512)),  # square, exercises the panel row-block boundary
+        ((), (1024, 1024)),  # square, multi row-block
+        ((), (4096, 512)),  # tall but few chunks -> WY, not blocked TSQR
+        ((2,), (512, 512)),  # batched square
+        ((), (300, 260)),  # non-power-of-2, P does not divide n
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_linalg_lstsq_square_wy(batch, shape, dtype):
+    # Square-ish shapes route to the right-looking blocked QR (compact-WY):
+    # TSQR needs block_m >= NC, so it collapses to ONE program here (2048x2048
+    # took ~5.7 s); WY panels over columns instead and keeps the trailing
+    # update gridded. Tolerance is loose because a square Gaussian is
+    # ill-conditioned (kappa ~ n), so fp32 back-substitution amplifies -- the
+    # QR itself matches torch's R to ~1e-6.
+    m, n = shape
+    dev = flag_gems.device
+    A = torch.randn(*batch, m, n, dtype=dtype, device=dev)
+    b = torch.randn(*batch, m, dtype=dtype, device=dev)
+    ref = torch.linalg.lstsq(A, b, driver="gels")
+    with flag_gems.use_gems():
+        res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
+    assert res[0].shape == ref.solution.shape
+    sc = ref.solution.abs().max().clamp_min(1.0)
+    err = ((res[0] - ref.solution).abs().max() / sc).item()
+    assert err < 5e-2, f"square lstsq relerr {err:.2e} too large"
+
+
+@pytest.mark.linalg_lstsq
+@pytest.mark.parametrize("dtype", [torch.float64])
+def test_linalg_lstsq_square_wy_fp64(dtype):
+    # fp64 square: same path, and fp64 conditioning is no longer the limit.
+    m, n = 256, 256
+    dev = flag_gems.device
+    A = torch.randn(m, n, dtype=dtype, device=dev)
+    b = torch.randn(m, dtype=dtype, device=dev)
+    ref = torch.linalg.lstsq(A, b, driver="gels")
+    with flag_gems.use_gems():
+        res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
+    sc = ref.solution.abs().max().clamp_min(1.0)
+    err = ((res[0] - ref.solution).abs().max() / sc).item()
+    assert err < 1e-6, f"fp64 square lstsq relerr {err:.2e} too large"
+
+
+@pytest.mark.linalg_lstsq
+@pytest.mark.parametrize(
+    "batch,shape",
+    [
+        ((), (512, 1024)),  # large m -> A^T QR routes to WY
+        ((), (1024, 2048)),  # larger still
+        ((), (300, 700)),  # non-power-of-2
+        ((2,), (512, 1024)),  # batched
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_linalg_lstsq_underdetermined_wy(batch, shape, dtype):
+    # Underdetermined with LARGE m. The min-norm path QRs A^T, whose short
+    # dimension is m -- so a big m makes TSQR collapse to a single program the
+    # same way square does on the tall path. These route to compact-WY instead.
+    # Untestable before that path existed (they took seconds).
+    m, n = shape
+    dev = flag_gems.device
+    A = torch.randn(*batch, m, n, dtype=dtype, device=dev)
+    b = torch.randn(*batch, m, dtype=dtype, device=dev)
+    ref = torch.linalg.lstsq(A, b, driver="gels")
+    with flag_gems.use_gems():
+        res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
+    assert res[0].shape == ref.solution.shape
+    sc = ref.solution.abs().max().clamp_min(1.0)
+    err = ((res[0] - ref.solution).abs().max() / sc).item()
+    assert err < 5e-2, f"wide-WY lstsq relerr {err:.2e} too large"
+    # min-norm is the defining property: verify feasibility A x ~= b directly,
+    # since any x with A x = b solves the system but only one has least norm.
+    feas = (torch.matmul(A, res[0].unsqueeze(-1)).squeeze(-1) - b).abs().max()
+    assert feas.item() < 5e-2, f"A x != b (feasibility {feas.item():.2e})"
