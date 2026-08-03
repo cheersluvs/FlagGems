@@ -1,3 +1,5 @@
+import functools
+
 import pytest
 import torch
 
@@ -7,6 +9,48 @@ from . import accuracy_utils as utils
 
 # gels fast path covers overdetermined (m >= n) float32. Shapes are (m, n).
 _SHAPES = [(16, 4), (64, 8), (128, 16), (200, 8), (256, 32)]
+
+
+@functools.lru_cache(maxsize=None)
+def _gems_supports(dtype):
+    """Does the registered gems kernel implement `dtype` on this device?
+
+    Deliberately NOT a hardware or dtype probe. Both mislead here: an Ascend
+    910B reports a float64 tensor as genuine float64 -- element_size 8, storage
+    8 bytes/element, and (1 + 2**-40) - 1 exact -- because those ops fall back
+    to the CPU, yet the device has no float64 unit and the backend's kernel
+    does not implement it. Checking `.dtype`, element_size or precision all
+    answer True there and the tests then fail rather than skip.
+
+    What these tests actually depend on is whether the KERNEL supports the
+    dtype, and a backend states that by raising NotImplementedError. So ask it
+    directly, with the smallest possible call.
+
+    Only NotImplementedError counts as unsupported; any other exception returns
+    True so the test still runs and reports the real defect. A skip must never
+    be able to hide a genuine failure.
+    """
+    try:
+        A = torch.randn(4, 2, dtype=dtype, device=flag_gems.device)
+        b = torch.randn(4, dtype=dtype, device=flag_gems.device)
+    except Exception:
+        return False  # device cannot hold the dtype at all (complex here)
+    try:
+        with flag_gems.use_gems():
+            torch.ops.aten.linalg_lstsq(A, b, driver="gels")
+    except NotImplementedError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _require_dtype(dtype):
+    """Skip when the backend has no kernel for `dtype`, so a run stays red
+    only for real defects. Called inside the test rather than as a skipif mark
+    so nothing touches the device at collection time."""
+    if not _gems_supports(dtype):
+        pytest.skip(f"gems linalg_lstsq has no {dtype} kernel on this device")
 
 
 @pytest.mark.linalg_lstsq
@@ -130,6 +174,7 @@ def test_linalg_lstsq_underdetermined_blocked(shape, nrhs, dtype):
 @pytest.mark.linalg_lstsq
 @pytest.mark.parametrize("dtype", [torch.float64])
 def test_linalg_lstsq_underdetermined_blocked_fp64(dtype):
+    _require_dtype(torch.float64)
     # fp64 blocked wide: tile 512*64=32768 == fp64... use (48,512): >16384 budget
     m, n = 48, 512
     A = torch.randn(m, n, dtype=dtype, device=flag_gems.device)
@@ -222,6 +267,7 @@ def test_linalg_lstsq_tall_blocked(shape, nrhs, dtype):
 @pytest.mark.linalg_lstsq
 @pytest.mark.parametrize("dtype", [torch.float64])
 def test_linalg_lstsq_tall_blocked_fp64(dtype):
+    _require_dtype(torch.float64)
     # fp64 blocked path (fp64 tall ALWAYS routes to blocked kernels: measured
     # 3.5-10x slower monolithic at every NC, SMEM exhaustion at NC>=129).
     m, n = 256, 80
@@ -258,6 +304,7 @@ def test_linalg_lstsq_rank_deficient(dtype):
 @pytest.mark.parametrize("shape", [(64, 8), (16, 64)])  # tall and wide
 @pytest.mark.parametrize("dtype", [torch.float64])
 def test_linalg_lstsq_fp64(shape, dtype):
+    _require_dtype(torch.float64)
     # float64 is now a NATIVE path (not a fallback). gelsd is CPU-only, so the
     # reference is computed on CPU and moved to device (harness compares on-device).
     m, n = shape
@@ -330,6 +377,7 @@ def test_linalg_lstsq_degenerate(batch, m, n, nrhs):
 
 @pytest.mark.linalg_lstsq
 def test_linalg_lstsq_complex_fallback():
+    _require_dtype(torch.complex64)
     # complex is outside the native real-only path -> must fall back (not crash)
     # and still be correct. Manual compare: the harness dtype path is real-only.
     m, n = 64, 8
@@ -380,6 +428,7 @@ def test_linalg_lstsq_square_wy(batch, shape, dtype):
 @pytest.mark.linalg_lstsq
 @pytest.mark.parametrize("dtype", [torch.float64])
 def test_linalg_lstsq_square_wy_fp64(dtype):
+    _require_dtype(torch.float64)
     # fp64 square: same path, and fp64 conditioning is no longer the limit.
     m, n = 256, 256
     dev = flag_gems.device
