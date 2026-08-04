@@ -38,7 +38,21 @@ def _lstsq_via_qr(A, b, driver="gels"):
     so the baseline stays overwhelmingly on device. The composition skips the
     residual norms the operator also returns, which biases slightly in the
     operator's favour -- worth knowing when reading the numbers.
+
+    Only `gels` is composed here. The other drivers are different algorithms,
+    not different flags: gelsy uses a complete orthogonal factorization, gelsd
+    and gelss use an SVD, and all three are rank-revealing. Substituting this
+    QR composition for any of them would silently produce a gels reference
+    while the operator computed something else -- a wrong baseline that still
+    looks like a valid speedup. Reject them rather than ignore the argument.
     """
+    if driver not in (None, "gels"):
+        raise ValueError(
+            f"_lstsq_via_qr composes the gels (QR) algorithm only; got "
+            f"driver={driver!r}. gelsy/gelsd/gelss are rank-revealing and need "
+            f"a different decomposition, so this reference cannot stand in for "
+            f"them -- add the matching composition instead of relaxing this."
+        )
     vec = b.ndim == A.ndim - 1
     B = b.unsqueeze(-1) if vec else b
     m, n = A.shape[-2], A.shape[-1]
