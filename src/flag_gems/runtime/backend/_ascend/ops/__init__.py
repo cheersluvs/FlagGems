@@ -53,6 +53,7 @@ from .index import index
 from .index_add import index_add, index_add_
 from .index_select import index_select
 from .isin import isin
+from .linalg_lstsq import linalg_lstsq
 from .linspace import linspace
 from .log_softmax import log_softmax, log_softmax_backward, log_softmax_out
 from .masked_fill import masked_fill, masked_fill_
@@ -69,6 +70,7 @@ from .ones import ones
 from .ones_like import ones_like
 from .outer import outer
 from .polar import polar
+from .polygamma import polygamma_
 from .pow import (
     pow_scalar,
     pow_tensor_scalar,
@@ -151,6 +153,7 @@ __all__ = [
     "index_add_",
     "index_select",
     "isin",
+    "linalg_lstsq",
     "linspace",
     "log_softmax",
     "log_softmax_backward",
@@ -176,6 +179,7 @@ __all__ = [
     "ones_like",
     "outer",
     "polar",
+    "polygamma_",
     "pow_scalar",
     "pow_tensor_scalar",
     "pow_tensor_scalar_",
