@@ -284,20 +284,87 @@ def test_linalg_lstsq_tall_blocked_fp64(dtype):
 
 
 @pytest.mark.linalg_lstsq
+@pytest.mark.parametrize(
+    "shape,kind",
+    [
+        ((128, 6), "col"),  # single-tile QR
+        ((4096, 200), "col"),  # blocked TSQR: NC>128, <=256, >=16 chunks
+        ((256, 256), "col"),  # compact-WY (square)
+        ((16, 64), "row"),  # underdetermined min-norm
+    ],
+    ids=["tall_single", "tall_blocked", "square_wy", "wide"],
+)
 @pytest.mark.parametrize("dtype", [torch.float32])
-def test_linalg_lstsq_rank_deficient(dtype):
-    # A zero column makes r_ii exactly 0, which deterministically trips the rank
-    # guard -> NaN in the affected solution rows. (A merely near-dependent column
-    # is threshold-sensitive under fp32 and not a reliable guard test; gels is
-    # documented as undefined on rank-deficient input either way.)
-    m, n = 128, 6
+def test_linalg_lstsq_rank_deficient(shape, kind, dtype):
+    # Exactly-singular input, one shape per QR path. Each path has its own rank
+    # guard in a different kernel, so covering only the single-tile case leaves
+    # three guards untested.
+    #
+    # A zero column makes r_ii exactly 0 and trips the guard deterministically.
+    # (A merely near-dependent column is threshold-sensitive under fp32 and not
+    # a reliable guard test -- that case is covered contractually by
+    # test_linalg_lstsq_near_singular below. gels is documented as undefined on
+    # rank-deficient input either way, so only the guard, not the values, is
+    # asserted here.)
+    #
+    # For m < n the deficiency has to be a zero ROW: the min-norm path QRs A^T,
+    # where a zero row of A is a zero column, which is what makes R singular.
+    m, n = shape
     A = torch.randn(m, n, dtype=dtype, device=flag_gems.device)
-    A[:, 3] = 0.0
+    if kind == "col":
+        A[:, 3] = 0.0
+    else:
+        A[2, :] = 0.0
     b = torch.randn(m, dtype=dtype, device=flag_gems.device)
 
+    # Deliberately NOT compared against torch here: on EXACTLY singular input
+    # torch's own behaviour is backend-dependent, so there is no single
+    # reference to match. CPU LAPACK ?gels reports the deficiency (info > 0) and
+    # PyTorch raises _LinAlgError ("... does not have full rank (error code: 4)",
+    # the 1-based index of the dead column); cuSOLVER's gels does not check and
+    # returns NaN/garbage silently. We follow the CUDA behaviour -- NaN, per the
+    # deficient-gels contract -- and assert that directly. The comparison with
+    # torch lives in test_linalg_lstsq_near_singular, where the matrix is only
+    # ill-conditioned and every backend agrees.
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
+
+    assert res[0].shape == (n,), "vector RHS -> solution is squeezed to (n,)"
     assert torch.isnan(res[0]).any(), "rank-deficient A should yield NaN solution"
+    # How FAR the NaN spreads is deliberately not asserted. It is not part of
+    # the gels contract -- the result is undefined on rank-deficient input --
+    # and it already differs by path: measured all-NaN on the tall and square
+    # paths, where it reaches every row, so pinning "only the rows from the dead
+    # pivot upward" would be pinning implementation behaviour, not a spec.
+
+
+@pytest.mark.linalg_lstsq
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_linalg_lstsq_near_singular(dtype):
+    # Near-singular (not exactly singular): whether the guard fires depends on
+    # where r_ii lands relative to rcond * max|r_jj|, which is not stable under
+    # fp32 -- so neither NaN nor a value comparison is assertable here.
+    #
+    # What IS part of torch's contract, and is asserted: gels does not raise on
+    # an ill-conditioned matrix, and the returned tuple keeps its shapes and
+    # dtypes. Silently raising, or degrading to a differently-shaped result,
+    # would be an incompatibility that the exactly-singular test above cannot
+    # catch.
+    m, n = 128, 6
+    A = torch.randn(m, n, dtype=dtype, device=flag_gems.device)
+    eps = torch.randn(m, dtype=dtype, device=flag_gems.device) * 1e-6
+    A[:, 4] = A[:, 1] + eps  # column 4 nearly duplicates column 1
+    b = torch.randn(m, dtype=dtype, device=flag_gems.device)
+
+    ref = torch.linalg.lstsq(A, b, driver="gels")
+    with flag_gems.use_gems():
+        res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
+
+    assert res[0].shape == ref.solution.shape
+    assert res[0].dtype == ref.solution.dtype
+    assert res[1].shape == ref.residuals.shape
+    assert res[2].shape == ref.rank.shape
+    assert res[3].shape == ref.singular_values.shape
 
 
 @pytest.mark.linalg_lstsq
@@ -406,6 +473,13 @@ def test_linalg_lstsq_complex_fallback():
 )
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test_linalg_lstsq_square_wy(batch, shape, dtype):
+    # Seeded: this case is deliberately loose-tolerance because a square
+    # Gaussian is ill-conditioned (kappa ~ n), so whether it lands inside
+    # the bound depends on the matrix drawn. Without a seed it inherits
+    # whatever RNG state earlier tests left behind, which makes it fail or
+    # pass according to what else is in the file -- a latent flake that
+    # surfaces the moment a test is added above it.
+    torch.manual_seed(0)
     # Square-ish shapes route to the right-looking blocked QR (compact-WY):
     # TSQR needs block_m >= NC, so it collapses to ONE program here (2048x2048
     # took ~5.7 s); WY panels over columns instead and keeps the trailing
@@ -429,6 +503,13 @@ def test_linalg_lstsq_square_wy(batch, shape, dtype):
 @pytest.mark.parametrize("dtype", [torch.float64])
 def test_linalg_lstsq_square_wy_fp64(dtype):
     _require_dtype(torch.float64)
+    # Seeded: this case is deliberately loose-tolerance because a square
+    # Gaussian is ill-conditioned (kappa ~ n), so whether it lands inside
+    # the bound depends on the matrix drawn. Without a seed it inherits
+    # whatever RNG state earlier tests left behind, which makes it fail or
+    # pass according to what else is in the file -- a latent flake that
+    # surfaces the moment a test is added above it.
+    torch.manual_seed(0)
     # fp64 square: same path, and fp64 conditioning is no longer the limit.
     m, n = 256, 256
     dev = flag_gems.device
@@ -454,6 +535,13 @@ def test_linalg_lstsq_square_wy_fp64(dtype):
 )
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test_linalg_lstsq_underdetermined_wy(batch, shape, dtype):
+    # Seeded: this case is deliberately loose-tolerance because a square
+    # Gaussian is ill-conditioned (kappa ~ n), so whether it lands inside
+    # the bound depends on the matrix drawn. Without a seed it inherits
+    # whatever RNG state earlier tests left behind, which makes it fail or
+    # pass according to what else is in the file -- a latent flake that
+    # surfaces the moment a test is added above it.
+    torch.manual_seed(0)
     # Underdetermined with LARGE m. The min-norm path QRs A^T, whose short
     # dimension is m -- so a big m makes TSQR collapse to a single program the
     # same way square does on the tall path. These route to compact-WY instead.
