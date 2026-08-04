@@ -53,7 +53,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 logger = logging.getLogger(__name__)
 
 _BUDGET_ELEMS = 36 * 1024 // 4
