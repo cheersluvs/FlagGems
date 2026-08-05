@@ -11,6 +11,40 @@ from . import accuracy_utils as utils
 _SHAPES = [(16, 4), (64, 8), (128, 16), (200, 8), (256, 32)]
 
 
+# Condition number of the WY cases is CONTROLLED, not sampled. The forward error
+# of a least-squares solve scales with kappa(A), and a square Gaussian has
+# kappa ~ n with a heavy tail (P(kappa > t*n) ~ 1/t) -- so a tolerance chosen
+# against a random draw is a probabilistic bound, not a bound. Following
+# tests/test_linalg_svdvals.py, build the matrix through a LOCAL generator and
+# re-impose singular values spread over [1, KAPPA]: deterministic, kappa known
+# and independent of n, and the global RNG stream is left untouched so the
+# tests stay order-independent.
+_WY_KAPPA = 10.0
+# kappa * eps_fp32 ~ 1.2e-6 per operation; over an n-column QR the accumulated
+# forward error is ~n * kappa * eps, i.e. ~1.2e-3 at n=1024. 5e-3 is ~4x that,
+# and 10x tighter than the sampled-kappa bound it replaces.
+_WY_ATOL = 5e-3
+
+
+def _cond_bounded(shape, dtype, device, seed=42, kappa=_WY_KAPPA):
+    """Matrix with a KNOWN condition number, built deterministically on CPU."""
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    A = torch.randn(*shape, generator=g, dtype=torch.float64, device="cpu")
+    U, _, Vh = torch.linalg.svd(A, full_matrices=False)
+    k = min(shape[-2], shape[-1])
+    S = torch.linspace(kappa, 1.0, k, dtype=torch.float64, device="cpu")
+    return ((U * S) @ Vh).to(dtype=dtype).to(device)
+
+
+def _det_randn(shape, dtype, device, seed):
+    """Deterministic tensor that does not consume the global RNG stream."""
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    t = torch.randn(*shape, generator=g, dtype=torch.float64, device="cpu")
+    return t.to(dtype=dtype).to(device)
+
+
 @functools.lru_cache(maxsize=None)
 def _gems_supports(dtype):
     """Does the registered gems kernel implement `dtype` on this device?
@@ -473,48 +507,35 @@ def test_linalg_lstsq_complex_fallback():
 )
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test_linalg_lstsq_square_wy(batch, shape, dtype):
-    # Seeded: this case is deliberately loose-tolerance because a square
-    # Gaussian is ill-conditioned (kappa ~ n), so whether it lands inside
-    # the bound depends on the matrix drawn. Without a seed it inherits
-    # whatever RNG state earlier tests left behind, which makes it fail or
-    # pass according to what else is in the file -- a latent flake that
-    # surfaces the moment a test is added above it.
-    torch.manual_seed(0)
     # Square-ish shapes route to the right-looking blocked QR (compact-WY):
     # TSQR needs block_m >= NC, so it collapses to ONE program here (2048x2048
     # took ~5.7 s); WY panels over columns instead and keeps the trailing
-    # update gridded. Tolerance is loose because a square Gaussian is
-    # ill-conditioned (kappa ~ n), so fp32 back-substitution amplifies -- the
-    # QR itself matches torch's R to ~1e-6.
+    # update gridded. The point of the case is the CODE PATH, not conditioning,
+    # so kappa is bounded by construction (see _cond_bounded).
     m, n = shape
     dev = flag_gems.device
-    A = torch.randn(*batch, m, n, dtype=dtype, device=dev)
-    b = torch.randn(*batch, m, dtype=dtype, device=dev)
+    A = _cond_bounded((*batch, m, n), dtype, dev, seed=42)
+    b = _det_randn((*batch, m), dtype, dev, seed=43)
     ref = torch.linalg.lstsq(A, b, driver="gels")
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
     assert res[0].shape == ref.solution.shape
-    sc = ref.solution.abs().max().clamp_min(1.0)
-    err = ((res[0] - ref.solution).abs().max() / sc).item()
-    assert err < 5e-2, f"square lstsq relerr {err:.2e} too large"
+    utils.gems_assert_close(
+        res[0], utils.to_reference(ref.solution), dtype, atol=_WY_ATOL
+    )
 
 
 @pytest.mark.linalg_lstsq
 @pytest.mark.parametrize("dtype", [torch.float64])
 def test_linalg_lstsq_square_wy_fp64(dtype):
     _require_dtype(torch.float64)
-    # Seeded: this case is deliberately loose-tolerance because a square
-    # Gaussian is ill-conditioned (kappa ~ n), so whether it lands inside
-    # the bound depends on the matrix drawn. Without a seed it inherits
-    # whatever RNG state earlier tests left behind, which makes it fail or
-    # pass according to what else is in the file -- a latent flake that
-    # surfaces the moment a test is added above it.
-    torch.manual_seed(0)
     # fp64 square: same path, and fp64 conditioning is no longer the limit.
+    # kappa is bounded here too, so the 1e-6 bound below is a real bound rather
+    # than one that happens to hold for the matrix that was drawn.
     m, n = 256, 256
     dev = flag_gems.device
-    A = torch.randn(m, n, dtype=dtype, device=dev)
-    b = torch.randn(m, dtype=dtype, device=dev)
+    A = _cond_bounded((m, n), dtype, dev, seed=46)
+    b = _det_randn((m,), dtype, dev, seed=47)
     ref = torch.linalg.lstsq(A, b, driver="gels")
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
@@ -535,28 +556,21 @@ def test_linalg_lstsq_square_wy_fp64(dtype):
 )
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test_linalg_lstsq_underdetermined_wy(batch, shape, dtype):
-    # Seeded: this case is deliberately loose-tolerance because a square
-    # Gaussian is ill-conditioned (kappa ~ n), so whether it lands inside
-    # the bound depends on the matrix drawn. Without a seed it inherits
-    # whatever RNG state earlier tests left behind, which makes it fail or
-    # pass according to what else is in the file -- a latent flake that
-    # surfaces the moment a test is added above it.
-    torch.manual_seed(0)
     # Underdetermined with LARGE m. The min-norm path QRs A^T, whose short
     # dimension is m -- so a big m makes TSQR collapse to a single program the
     # same way square does on the tall path. These route to compact-WY instead.
     # Untestable before that path existed (they took seconds).
     m, n = shape
     dev = flag_gems.device
-    A = torch.randn(*batch, m, n, dtype=dtype, device=dev)
-    b = torch.randn(*batch, m, dtype=dtype, device=dev)
+    A = _cond_bounded((*batch, m, n), dtype, dev, seed=44)
+    b = _det_randn((*batch, m), dtype, dev, seed=45)
     ref = torch.linalg.lstsq(A, b, driver="gels")
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
     assert res[0].shape == ref.solution.shape
-    sc = ref.solution.abs().max().clamp_min(1.0)
-    err = ((res[0] - ref.solution).abs().max() / sc).item()
-    assert err < 5e-2, f"wide-WY lstsq relerr {err:.2e} too large"
+    utils.gems_assert_close(
+        res[0], utils.to_reference(ref.solution), dtype, atol=_WY_ATOL
+    )
     # min-norm is the defining property: verify feasibility A x ~= b directly,
     # since any x with A x = b solves the system but only one has least norm.
     feas = (torch.matmul(A, res[0].unsqueeze(-1)).squeeze(-1) - b).abs().max()
