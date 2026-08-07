@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import dataclasses
+import importlib
+import logging
 import random
 
 import pytest
@@ -23,15 +25,118 @@ from flag_gems.utils.device_info import get_device_capability
 
 from . import base
 
+logger = logging.getLogger(__name__)
+torch_device_fn = flag_gems.runtime.torch_device_fn
+
+
+# NVIDIA gates FP8 E4M3 on sm_89+, and this check has historically been spelled
+# `get_device_capability() >= (8, 9)`. That number only means "Ada or newer" on
+# NVIDIA; other vendors report their own major/minor on a different scale, so
+# applying the threshold to them is a false negative that skips this whole file
+# on hardware that supports the dtype. Add a vendor here only after verifying
+# on it that a Triton `tl.float8e4nv` conversion matches `torch.float8_e4m3fn`
+# bit-for-bit -- MetaX C550 reports (8, 0) and does (verified 2026-08-05).
+_FP8E4NV_CAPABLE_VENDORS = frozenset({"metax"})
+
 
 def is_support_fp8e4nv():
+    if not hasattr(torch, "float8_e4m3fn"):
+        return False
+    if flag_gems.vendor_name in _FP8E4NV_CAPABLE_VENDORS:
+        return True
     major, minor = get_device_capability()
     return major * 10 + minor >= 89
 
 
-VLLM_REF_AVAILABLE = hasattr(
-    torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
-)
+# The reference is registered under `torch.ops._C` by a compiled op library, and
+# probing that namespace does not import it -- so where the reference IS
+# installed, a bare hasattr() reports it missing and no comparison runs.
+#
+# `vllm._custom_ops` is the portable entry point: it is how vLLM itself loads
+# its custom ops, and vendor ports patch it, so it resolves to the right library
+# per platform (verified on MetaX C550, where `import vllm._C` fails on
+# libcudart but `vllm._custom_ops` registers all 57 ops via mcoplib).
+# `mcoplib._C` is kept as a fallback for installs that have the vendor library
+# without vLLM. Importing the top-level package is not enough -- the compiled
+# submodule has to be imported before the schemas register.
+VENDOR_OP_LIBS = ("vllm._custom_ops", "mcoplib._C")
+
+
+def _load_vendor_ref(op_name):
+    """Return `torch.ops._C.<op_name>`, importing vendor libraries as needed.
+
+    Returns None if no library provides it. Import failures are logged rather
+    than swallowed -- a silent `except: pass` is what makes a missing baseline
+    indistinguishable from an unimportable one.
+    """
+    fn = getattr(torch.ops._C, op_name, None)
+    if callable(fn):
+        return fn
+    for lib in VENDOR_OP_LIBS:
+        try:
+            importlib.import_module(lib)
+        except Exception as e:
+            logger.info("vendor op library %s unavailable: %s", lib, e)
+            continue
+        fn = getattr(torch.ops._C, op_name, None)
+        if callable(fn):
+            logger.info("found %s in %s", op_name, lib)
+            return fn
+        logger.info("%s loaded but does not provide %s", lib, op_name)
+    logger.info(
+        "no vendor kernel for %s (tried %s)", op_name, ", ".join(VENDOR_OP_LIBS)
+    )
+    return None
+
+
+def _skip_if_unrunnable(ref, op_name):
+    """Wrap the reference so a registered-but-unlaunchable kernel skips.
+
+    A vendor can register the op and still not be able to run it: MetaX's build
+    returns `mcErrorInvalidValue` from every launch on C550. Failing the
+    benchmark there blames FlagGems for someone else's defect, while the old
+    `hasattr` gate hid the situation entirely by skipping as "not installed".
+    Skip, but with the launch error as the reason.
+
+    The first call forces the error to surface. A failed launch is reported
+    asynchronously, so left alone it lands on whatever call comes next -- for
+    MetaX that is `do_bench`'s 256 MB L2-flush allocation, which makes the
+    failure both unattributable and too late to convert. Surfacing it takes a
+    *new kernel launch*: on that backend `synchronize()` on its own is silent,
+    and so is a device-to-host copy, while any launch (or an allocation large
+    enough to reach the driver) raises. Hence the throwaway reduction below.
+    Only the first call pays for it.
+
+    `pytest.skip` raises `Skipped`, which derives from `BaseException` and so
+    passes through the harness's `except (RuntimeError, Exception)` intact.
+    """
+    checked = False
+
+    def wrapper(*args, **kwargs):
+        nonlocal checked
+        if checked:
+            return ref(*args, **kwargs)
+        try:
+            out = ref(*args, **kwargs)
+            torch.zeros(1, device=flag_gems.device).sum()
+            torch_device_fn.synchronize()
+        except Exception as e:
+            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+            pytest.skip(
+                f"{op_name} is registered but its kernel fails to run: {reason}"
+            )
+        checked = True
+        return out
+
+    return wrapper
+
+
+_VENDOR_REF = _load_vendor_ref("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert")
+VLLM_REF_AVAILABLE = _VENDOR_REF is not None
+if VLLM_REF_AVAILABLE:
+    _VENDOR_REF = _skip_if_unrunnable(
+        _VENDOR_REF, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+    )
 HEAD_DIM = 512
 ROPE_DIM = 64
 HEAD_BYTES = 584
@@ -59,7 +164,7 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
     def __init__(self):
         super().__init__(
             "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+            _VENDOR_REF,
             [torch.bfloat16],
         )
         self.set_gems(flag_gems.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert)
@@ -170,11 +275,11 @@ class FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark(base.Benchmark):
 
 @pytest.mark.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
 @pytest.mark.skipif(
-    not VLLM_REF_AVAILABLE, reason="The referenced vLLM implementation is not installed"
+    not VLLM_REF_AVAILABLE,
+    reason="No vendor kernel found for this operator (tried %s)"
+    % ", ".join(VENDOR_OP_LIBS),
 )
-@pytest.mark.skipif(
-    not is_support_fp8e4nv(), reason="Do not support fp8e4nv when capability < 89"
-)
+@pytest.mark.skipif(not is_support_fp8e4nv(), reason="Device does not support fp8e4nv")
 def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert():
     bench = FusedDeepseekV4QnormRopeKVRopeQuantInsertBenchmark()
     bench.run()
