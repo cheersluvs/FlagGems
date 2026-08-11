@@ -103,9 +103,18 @@ def test_linalg_lstsq_gems_path_active():
 
 
 def _ref_and_gems(A, b, dtype):
-    """Reference via CPU gels; gems via the aten override under use_gems."""
-    ref_A = utils.to_reference(A)
-    ref_b = utils.to_reference(b)
+    """Reference via gels at float64; gems via the aten override under use_gems.
+
+    The reference is upcast because on backends where to_reference keeps the
+    tensor on the device, `torch.linalg.lstsq` is the VENDOR's kernel, not
+    truth. Measured on a MetaX C550: against a float64 CPU solve, this op was
+    off by 5.2e-08 while the vendor's own fp32 lstsq was off by 1.3e-04 -- so
+    the fp32 reference was failing the comparison on its own error, not ours.
+    Upcasting is gated on fp64 support, so devices without it (Ascend 910B)
+    keep the fp32 reference they had.
+    """
+    ref_A = utils.to_reference(A, upcast=True)
+    ref_b = utils.to_reference(b, upcast=True)
     ref = torch.linalg.lstsq(ref_A, ref_b, driver="gels")
 
     with flag_gems.use_gems():
