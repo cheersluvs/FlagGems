@@ -130,10 +130,21 @@ def _bc() -> int:
         _BC = bc32
         _generic._WY_BLOCK_C = _BC  # keep the generic grid in step with _wy_cfg
         _generic._TARGET_STACK_ROWS = _derive_stack_rows()
+        # The panel kernel's tile is block_m x next_pow2(NC), and
+        # _choose_block_m sizes block_m so that product stays under
+        # _TARGET_TILE_BYTES. Upstream's 96KB presumes an NVIDIA-sized shared
+        # memory; on a 64KB part it yields 256x64x4 = 65536 B at NC=33 -- the
+        # entire limit -- and maca3720 then asks for 66560 with launch
+        # overhead. Budget half, exactly as the other two tiles do.
+        _generic._TARGET_TILE_BYTES = min(
+            _generic._TARGET_TILE_BYTES, _smem_per_block() // 2
+        )
         logger.debug(
-            "GEMS_METAX LINALG_LSTSQ: BLOCK_C=%d, TARGET_STACK_ROWS=%d " "(smem %d B)",
+            "GEMS_METAX LINALG_LSTSQ: BLOCK_C=%d, TARGET_STACK_ROWS=%d, "
+            "TARGET_TILE_BYTES=%d (smem %d B)",
             _BC,
             _generic._TARGET_STACK_ROWS,
+            _generic._TARGET_TILE_BYTES,
             _smem_per_block(),
         )
     return _BC
