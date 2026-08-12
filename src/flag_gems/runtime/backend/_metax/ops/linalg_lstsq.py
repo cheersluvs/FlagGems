@@ -73,6 +73,28 @@ def _derive_bc(ubr: int, es: int) -> int:
     return bc
 
 
+def _derive_stack_rows(es: int = 4) -> int:
+    """Largest _TARGET_STACK_ROWS whose reduce tile still fits in shared memory.
+
+    The monolithic path stacks G = max(2, _TARGET_STACK_ROWS // NC) R factors
+    and reduces them in one tile of next_pow2(G*NC) x next_pow2(NC). At the
+    upstream 256 that is 256x64x4 = 65536 B for NC=33 -- exactly a C550's
+    limit, which is why it fit there and nowhere else: maca3720's Triton asks
+    for 66560 (the tile plus ~1KB of launch overhead) and raises OutOfResources.
+
+    Sitting on the limit is not fitting. Budget half of it, as the WY path
+    does, so the tile has room for that overhead and two blocks stay resident.
+    """
+    sr = _generic._TARGET_STACK_ROWS
+    budget = _smem_per_block() // 2
+    # Worst case is the widest tile the monolithic path can be handed, which
+    # the NC cap below bounds.
+    bnc = _generic._next_pow2(_generic._TALL_MAX_NC_F32)
+    while sr > 64 and _generic._next_pow2(sr) * bnc * es > budget:
+        sr //= 2
+    return sr
+
+
 _BC = None
 
 
@@ -107,9 +129,11 @@ def _bc() -> int:
             )
         _BC = bc32
         _generic._WY_BLOCK_C = _BC  # keep the generic grid in step with _wy_cfg
+        _generic._TARGET_STACK_ROWS = _derive_stack_rows()
         logger.debug(
-            "GEMS_METAX LINALG_LSTSQ: BLOCK_C=%d (smem %d B)",
+            "GEMS_METAX LINALG_LSTSQ: BLOCK_C=%d, TARGET_STACK_ROWS=%d " "(smem %d B)",
             _BC,
+            _generic._TARGET_STACK_ROWS,
             _smem_per_block(),
         )
     return _BC
