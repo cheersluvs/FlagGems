@@ -73,23 +73,46 @@ def _derive_bc(ubr: int, es: int) -> int:
     return bc
 
 
-_BC_F32 = _derive_bc(min(_generic._WY_BLOCK_R, 128), 4)
-_BC_F64 = _derive_bc(64, 8)
+_BC = None
 
-# The generic driver computes the update grid from the MODULE constant
-# _WY_BLOCK_C while passing BLOCK_C from _wy_cfg. Those agree upstream, so the
-# mismatch is dormant there; here both are rebound, which keeps them agreeing
-# WITHOUT touching generic code -- but only while the two dtypes derive the
-# same value. They do on C550 (both 16). Fail loudly rather than silently
-# under-update the trailing block if a future device makes them differ.
-if _BC_F32 != _BC_F64:
-    raise RuntimeError(
-        "metax linalg_lstsq: fp32 and fp64 derive different BLOCK_C "
-        f"({_BC_F32} vs {_BC_F64}); the generic grid uses a single module "
-        "constant, so they must match. Fix the grid in "
-        "flag_gems/ops/linalg_lstsq.py to use the per-dtype value instead."
-    )
-_BC = _BC_F32
+
+def _bc() -> int:
+    """BLOCK_C for both dtypes, derived on FIRST USE -- never at import.
+
+    Deriving this at import would query the Triton driver while flag_gems is
+    still loading its vendor ops, i.e. before torch has touched the device.
+    Under the flagtree Triton backend used in CI that left the MACA context in
+    a state where the next launch -- an ordinary `torch.randn` -- failed with
+    `mcErrorInvalidDeviceFunction`. Nothing here needs to run before the
+    operator is first called, so nothing here does.
+    """
+    global _BC
+    if _BC is None:
+        bc32 = _derive_bc(min(_generic._WY_BLOCK_R, 128), 4)
+        bc64 = _derive_bc(64, 8)
+        # The generic driver computes the update grid from the MODULE constant
+        # _WY_BLOCK_C while passing BLOCK_C from _wy_cfg. Those agree upstream,
+        # so the mismatch is dormant there; rebinding both keeps them agreeing
+        # WITHOUT touching generic code -- but only while the two dtypes derive
+        # the same value. They do on C550 (both 16). Fail loudly rather than
+        # silently under-update the trailing block if a device makes them
+        # differ.
+        if bc32 != bc64:
+            raise RuntimeError(
+                "metax linalg_lstsq: fp32 and fp64 derive different BLOCK_C "
+                f"({bc32} vs {bc64}); the generic grid uses a single module "
+                "constant, so they must match. Fix the grid in "
+                "flag_gems/ops/linalg_lstsq.py to use the per-dtype value "
+                "instead."
+            )
+        _BC = bc32
+        _generic._WY_BLOCK_C = _BC  # keep the generic grid in step with _wy_cfg
+        logger.debug(
+            "GEMS_METAX LINALG_LSTSQ: BLOCK_C=%d (smem %d B)",
+            _BC,
+            _smem_per_block(),
+        )
+    return _BC
 
 
 @triton.jit
@@ -190,12 +213,11 @@ def _wy_update_metax(
 def _wy_cfg_metax(dt):
     """(panel BLOCK_R, update BLOCK_R, BLOCK_C, num_stages), BLOCK_C derived."""
     if dt == torch.float64:
-        return 256, 64, _BC, 2
-    return _generic._WY_BLOCK_R, min(_generic._WY_BLOCK_R, 128), _BC, 3
+        return 256, 64, _bc(), 2
+    return _generic._WY_BLOCK_R, min(_generic._WY_BLOCK_R, 128), _bc(), 3
 
 
-# ---- apply, once, at import ----
-_generic._WY_BLOCK_C = _BC  # keeps the generic grid in step with _wy_cfg
+# ---- apply, once, at import (pure Python rebinds; no device access) ----
 _generic._wy_cfg = _wy_cfg_metax
 _generic._wy_update = _wy_update_metax
 # The monolithic path's reduce kernel wants 5KB/thread of private memory at
@@ -206,15 +228,9 @@ _generic._wy_update = _wy_update_metax
 # here and is the no-ceiling path by design.
 _generic._TALL_MAX_NC_F32 = 64
 
-logger.debug(
-    "GEMS_METAX LINALG_LSTSQ: BLOCK_C=%d (smem %d B), _TALL_MAX_NC_F32=64, "
-    "fp64 tl.dot bypassed",
-    _BC,
-    _smem_per_block(),
-)
-
 
 def linalg_lstsq(A, b, rcond=None, driver=None):
     """Metax specialization: generic kernels, device-derived configuration."""
     logger.debug("GEMS_METAX LINALG_LSTSQ")
+    _bc()  # derive the device-dependent config now, on a live context
     return _generic.linalg_lstsq(A, b, rcond=rcond, driver=driver)
