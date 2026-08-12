@@ -112,6 +112,34 @@ class _Ref:
         self.residuals = residuals
 
 
+def _cpu_ref(A, b, driver="gels"):
+    """gels reference solved on the CPU, returned where the device expects it.
+
+    The tests below that build their own reference used to call
+    `torch.linalg.lstsq` on the DEVICE tensors, which runs the vendor's kernel
+    rather than a trusted one. On Iluvatar that raises outright --
+    `cusolver error ... cusolverDnDormqr_bufferSize` -- because its cuSOLVER
+    shim has no float64 QR, so the test failed on the reference rather than on
+    the operator. Solve on the CPU instead: same answer on every backend.
+
+    Only `solution` and `residuals` are carried, which is all the callers use;
+    the one test that also needs `rank` and `singular_values` keeps torch on
+    the device, since it is asserting torch's tuple contract rather than
+    numbers.
+    """
+    out = torch.linalg.lstsq(
+        A.detach().cpu().to(torch.float64),
+        b.detach().cpu().to(torch.float64),
+        driver=driver,
+    )
+    ref_dt = torch.float64 if utils.fp64_is_supported else torch.float32
+    dev = torch.device("cpu") if utils.TO_CPU else A.device
+    return _Ref(
+        out.solution.to(device=dev, dtype=ref_dt),
+        out.residuals.to(device=dev, dtype=ref_dt),
+    )
+
+
 def _ref_and_gems(A, b, dtype):
     """Reference via gels on the CPU in float64; gems via the aten override.
 
@@ -426,6 +454,10 @@ def test_linalg_lstsq_near_singular(dtype):
     A[:, 4] = A[:, 1] + eps  # column 4 nearly duplicates column 1
     b = torch.randn(m, dtype=dtype, device=flag_gems.device)
 
+    # Deliberately torch ON THE DEVICE, not _cpu_ref: this test asserts that
+    # gems returns the same 4-tuple contract torch does here -- shapes for
+    # solution, residuals, rank and singular_values -- so the device's own
+    # torch is the correct reference, and _Ref carries only two of those four.
     ref = torch.linalg.lstsq(A, b, driver="gels")
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
@@ -552,7 +584,7 @@ def test_linalg_lstsq_square_wy(batch, shape, dtype):
     dev = flag_gems.device
     A = _cond_bounded((*batch, m, n), dtype, dev, seed=42)
     b = _det_randn((*batch, m), dtype, dev, seed=43)
-    ref = torch.linalg.lstsq(A, b, driver="gels")
+    ref = _cpu_ref(A, b)
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
     assert res[0].shape == ref.solution.shape
@@ -572,7 +604,7 @@ def test_linalg_lstsq_square_wy_fp64(dtype):
     dev = flag_gems.device
     A = _cond_bounded((m, n), dtype, dev, seed=46)
     b = _det_randn((m,), dtype, dev, seed=47)
-    ref = torch.linalg.lstsq(A, b, driver="gels")
+    ref = _cpu_ref(A, b)
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
     sc = ref.solution.abs().max().clamp_min(1.0)
@@ -600,7 +632,7 @@ def test_linalg_lstsq_underdetermined_wy(batch, shape, dtype):
     dev = flag_gems.device
     A = _cond_bounded((*batch, m, n), dtype, dev, seed=44)
     b = _det_randn((*batch, m), dtype, dev, seed=45)
-    ref = torch.linalg.lstsq(A, b, driver="gels")
+    ref = _cpu_ref(A, b)
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
     assert res[0].shape == ref.solution.shape
