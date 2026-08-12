@@ -102,20 +102,43 @@ def test_linalg_lstsq_gems_path_active():
     )
 
 
-def _ref_and_gems(A, b, dtype):
-    """Reference via gels at float64; gems via the aten override under use_gems.
+class _Ref:
+    """Just the two fields the assertions read, so the solve can move off-device."""
 
-    The reference is upcast because on backends where to_reference keeps the
-    tensor on the device, `torch.linalg.lstsq` is the VENDOR's kernel, not
-    truth. Measured on a MetaX C550: against a float64 CPU solve, this op was
-    off by 5.2e-08 while the vendor's own fp32 lstsq was off by 1.3e-04 -- so
-    the fp32 reference was failing the comparison on its own error, not ours.
-    Upcasting is gated on fp64 support, so devices without it (Ascend 910B)
-    keep the fp32 reference they had.
+    __slots__ = ("solution", "residuals")
+
+    def __init__(self, solution, residuals):
+        self.solution = solution
+        self.residuals = residuals
+
+
+def _ref_and_gems(A, b, dtype):
+    """Reference via gels on the CPU in float64; gems via the aten override.
+
+    The reference is computed on the CPU, NOT through to_reference: on backends
+    where to_reference keeps the tensor on the device, `torch.linalg.lstsq` is
+    the VENDOR's kernel rather than truth, and it is neither reliably accurate
+    nor reliably present. Measured on a MetaX C550, against a float64 CPU
+    solve, this op was off by 5.2e-08 while the vendor's own fp32 lstsq was off
+    by 1.3e-04 -- so two cases were failing on the reference's error, not ours.
+    On maca3810 the fp64 device solve does not exist at all and raises
+    `invalid device function`. A CPU solve has neither problem and is the same
+    reference on every backend.
+
+    The result is moved back to the device so the comparison stays
+    device-to-device; the dtype of that copy is gated on fp64 support, so
+    devices without it (Ascend 910B) get an fp32 reference as before.
     """
-    ref_A = utils.to_reference(A, upcast=True)
-    ref_b = utils.to_reference(b, upcast=True)
-    ref = torch.linalg.lstsq(ref_A, ref_b, driver="gels")
+    ref_dt = torch.float64 if utils.fp64_is_supported else torch.float32
+    out = torch.linalg.lstsq(
+        A.detach().cpu().to(torch.float64),
+        b.detach().cpu().to(torch.float64),
+        driver="gels",
+    )
+    ref = _Ref(
+        out.solution.to(device=A.device, dtype=ref_dt),
+        out.residuals.to(device=A.device, dtype=ref_dt),
+    )
 
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
