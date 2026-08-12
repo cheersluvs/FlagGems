@@ -82,7 +82,21 @@ def _gems_supports(dtype):
 def _require_dtype(dtype):
     """Skip when the backend has no kernel for `dtype`, so a run stays red
     only for real defects. Called inside the test rather than as a skipif mark
-    so nothing touches the device at collection time."""
+    so nothing touches the device at collection time.
+
+    Two questions, cheapest first. A backend that declares `support_fp64 =
+    False` means it, and asking the operator cannot substitute: `_gems_supports`
+    probes with a 4x2 solve, which routes to the monolithic path and so answers
+    for one of four code paths. Measured on an Iluvatar BI-V150, which declares
+    False: float64 `tl.dot` does not compile, `torch.matmul` reports "gemm of
+    double is not supported on CoreX", cuSOLVER has neither `Dormqr` nor
+    `Dorgqr`, and every float64 copy warns "limited support" -- yet the 4x2
+    probe succeeds and a 256x256 float64 solve then returns NaN. The declared
+    flag is the honest gate; the probe stays as a second one for backends that
+    do have fp64 but lack this kernel.
+    """
+    if dtype in (torch.float64, torch.complex128) and not utils.fp64_is_supported:
+        pytest.skip(f"backend declares no fp64 support; {dtype} unavailable")
     if not _gems_supports(dtype):
         pytest.skip(f"gems linalg_lstsq has no {dtype} kernel on this device")
 

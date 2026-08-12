@@ -36,6 +36,15 @@ _generic = importlib.import_module("flag_gems.ops.linalg_lstsq")
 # was observed here (the other 74 cases pass with upstream's block sizes), and
 # configuration that has not been measured on the device does not belong in a
 # backend override.
+#
+# NOTE ON COVERAGE: this device declares `support_fp64 = False`, and it means
+# it -- `torch.matmul` reports "gemm of double is not supported on CoreX",
+# cuSOLVER has neither Dormqr nor Dorgqr, and a 256x256 float64 solve returns
+# NaN even with this kernel in place. The suite therefore SKIPS float64 here,
+# so the branch below is not exercised in CI. It is kept because it is correct
+# and because the compile error it removes is real: if Iluvatar gains usable
+# float64, the branch is what makes compact-WY work, and until then it costs
+# nothing -- COMPUTE is a tl.constexpr, so float32 compiles exactly as before.
 # ---------------------------------------------------------------------------
 
 
