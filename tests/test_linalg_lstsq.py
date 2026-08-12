@@ -125,19 +125,23 @@ def _ref_and_gems(A, b, dtype):
     `invalid device function`. A CPU solve has neither problem and is the same
     reference on every backend.
 
-    The result is moved back to the device so the comparison stays
-    device-to-device; the dtype of that copy is gated on fp64 support, so
-    devices without it (Ascend 910B) get an fp32 reference as before.
+    The result is placed where gems_assert_close expects it. Under `--ref=cpu`
+    (TO_CPU) that helper moves `res` to the CPU and asserts the reference is
+    ALREADY there, so the reference must stay on the CPU; otherwise it compares
+    on the device and the reference has to be moved back. The dtype of the copy
+    is gated on fp64 support, so devices without it (Ascend 910B) get an fp32
+    reference as before.
     """
     ref_dt = torch.float64 if utils.fp64_is_supported else torch.float32
+    ref_dev = torch.device("cpu") if utils.TO_CPU else A.device
     out = torch.linalg.lstsq(
         A.detach().cpu().to(torch.float64),
         b.detach().cpu().to(torch.float64),
         driver="gels",
     )
     ref = _Ref(
-        out.solution.to(device=A.device, dtype=ref_dt),
-        out.residuals.to(device=A.device, dtype=ref_dt),
+        out.solution.to(device=ref_dev, dtype=ref_dt),
+        out.residuals.to(device=ref_dev, dtype=ref_dt),
     )
 
     with flag_gems.use_gems():
