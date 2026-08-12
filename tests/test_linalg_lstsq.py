@@ -553,12 +553,14 @@ def test_linalg_lstsq_complex_fallback():
     A = torch.randn(m, n, dtype=torch.complex64, device=flag_gems.device)
     b = torch.randn(m, dtype=torch.complex64, device=flag_gems.device)
 
-    ref = torch.linalg.lstsq(A.cpu(), b.cpu(), driver="gels").solution.to(
-        flag_gems.device
-    )
+    ref = torch.linalg.lstsq(A.cpu(), b.cpu(), driver="gels").solution
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b)
-    assert torch.allclose(res[0], ref, atol=1e-4, rtol=1e-4)
+    # Compare on the CPU. torch.allclose on complex tensors needs an elementwise
+    # complex abs, and Iluvatar's runtime compiler cannot build one:
+    # `[IXRTC] nvrtcCompileProgram failed ... abs_kernel<std::complex<float>>`.
+    # The comparison gains nothing from running on the device.
+    assert torch.allclose(res[0].cpu(), ref, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.linalg_lstsq
@@ -607,8 +609,12 @@ def test_linalg_lstsq_square_wy_fp64(dtype):
     ref = _cpu_ref(A, b)
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b, driver="gels")
+    # to_cpu, not bare arithmetic: under --ref=cpu the reference stays on the
+    # CPU while res is on the device, and this test compares them directly
+    # rather than through gems_assert_close.
+    sol = utils.to_cpu(res[0], ref.solution)
     sc = ref.solution.abs().max().clamp_min(1.0)
-    err = ((res[0] - ref.solution).abs().max() / sc).item()
+    err = ((sol - ref.solution).abs().max() / sc).item()
     assert err < 1e-6, f"fp64 square lstsq relerr {err:.2e} too large"
 
 
