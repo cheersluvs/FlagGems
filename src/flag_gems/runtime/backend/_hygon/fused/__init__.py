@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+)
 from .sparse_attention import sparse_attn_triton
 from .top_k_per_row_prefill import top_k_per_row_prefill
 
 __all__ = [
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "sparse_attn_triton",
     "top_k_per_row_prefill",
 ]
