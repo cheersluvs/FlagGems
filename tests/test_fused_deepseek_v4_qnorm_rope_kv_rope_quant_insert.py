@@ -57,16 +57,22 @@ NUM_QUANT_BLOCKS = NOPE_DIM // QUANT_BLOCK  # 7
 SCALE_BYTES_PER_TOKEN = NUM_QUANT_BLOCKS + 1  # 8
 HEAD_BYTES = TOKEN_DATA_BYTES + SCALE_BYTES_PER_TOKEN  # 584
 
-# Bytes of device memory the fp32 reference needs per element of
-# [num_tokens, n_heads, HEAD_DIM]. The op itself is cheap; the reference is what
-# blows up, because it upcasts q to fp32: q (bf16, 2B) + q_ref (bf16, 2B) + the
-# fp32 upcast (4B) + the fp32 result (4B) = 12 B/elem live at once, plus
-# allocator headroom. Two observations bracket the real figure:
-#   > 13.2 -- 98304 x 128 OOMs on an 80GB H800 (the shape the old hardcoded
-#             exclusion list was written for)
-#   <=15.5 -- 65536 x 128, an identical element count, passes on a 63.59GB
-#             MetaX C550
-REF_BYTES_PER_ELEM = 14
+# Device memory the reference needs, split into the part that scales with the
+# input and the part `ref_impl_chunked` bounds.
+#
+# Persistent for the whole call: q (bf16, 2B) + q_ref (bf16, 2B) = 4 B/elem.
+# Per slice: the fp32 upcast (4B) + the fp32 result (4B) + allocator headroom.
+# Because the reference is evaluated at most _REF_MAX_ELEMS at a time, that
+# second term stops growing with the input.
+#
+# Before chunking a single figure of 14 B/elem was needed, bracketed by two
+# observations: 98304 x 128 OOMed on an 80GB H800 -- the shape the old hardcoded
+# exclusion list was written for -- while 65536 x 128, an identical element
+# count, passed on a 63.59GB MetaX C550. Chunking removes that cliff: all 60
+# cases run on a 64GB Hygon BW1000, including the four the old list excluded,
+# which had therefore never executed on any card.
+REF_BYTES_PER_ELEM_PERSISTENT = 4
+REF_BYTES_PER_ELEM_IN_SLICE = 10
 
 
 def _free_device_memory():
@@ -103,10 +109,9 @@ def _skip_if_reference_wont_fit(num_tokens: int, n_heads: int):
 
     Replaces a hardcoded exclusion list tuned for an 80GB H800, which still
     OOMs on 64GB cards -- MetaX C550 died at num_tokens=131072, n_heads=64,
-    inside the reference and before the op was ever called. At
-    REF_BYTES_PER_ELEM the rule reproduces the old H800 exclusion list exactly
-    on an 80GB card, and on a 64GB C550 leaves 131072 x 64 to the
-    OutOfMemoryError handler below rather than pre-skipping it.
+    inside the reference and before the op was ever called. With the reference
+    chunked the fp32 temporaries no longer scale with the input, so the shapes
+    that list excluded now fit and run.
 
     This is a cheap pre-check that avoids allocating tens of GiB only to fail.
     It is deliberately not the whole story: whether a marginal shape fits also
@@ -114,7 +119,11 @@ def _skip_if_reference_wont_fit(num_tokens: int, n_heads: int):
     131072 x 64, an identical element count, does not), so the reference call
     itself also catches OutOfMemoryError.
     """
-    needed = num_tokens * n_heads * HEAD_DIM * REF_BYTES_PER_ELEM
+    elems = num_tokens * n_heads * HEAD_DIM
+    needed = (
+        elems * REF_BYTES_PER_ELEM_PERSISTENT
+        + min(elems, _REF_MAX_ELEMS) * REF_BYTES_PER_ELEM_IN_SLICE
+    )
     free = _free_device_memory()
     if free is not None and needed > free:
         pytest.skip(
@@ -345,6 +354,66 @@ def fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
     )
 
 
+# The reference is an oracle, and an oracle has to be evaluated where it fits and
+# where the framework is trustworthy. Both helpers below exist for that.
+#
+# Slicing along tokens is exact here: RMSNorm is per (token, head), RoPE and
+# quantisation are per token, and each token writes its own cache slot, so no
+# reduction crosses a slice boundary. Verified bit-identical against a
+# whole-input evaluation.
+#
+# Two independent reasons to do it. It bounds peak memory by the slice rather
+# than the input -- at 131072 x 64 the whole-input form asks for a single 16GiB
+# fp32 allocation, which is the actual OOM on a 64GB card. And on a backend whose
+# framework returns wrong results for very large tensors it keeps the oracle in a
+# range where it can be trusted: one disagreed with the operator on 4.16% of
+# elements at 3.22e9 elements whole-input and 0.0002% in four slices, while the
+# operator's own output was byte-identical either way.
+_REF_MAX_ELEMS = 1 << 30
+
+
+def ref_impl_chunked(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
+    num_tokens = q.shape[0]
+    per_token = q.shape[1] * q.shape[2]
+    step = max(1, _REF_MAX_ELEMS // max(1, per_token))
+    n_ins = slot_mapping.shape[0]
+    if step >= num_tokens:
+        ref_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs)
+        return
+    for i in range(0, num_tokens, step):
+        j = min(i + step, num_tokens)
+        ref_impl(
+            q[i:j],
+            kv[i:j],
+            k_cache,
+            slot_mapping[i : min(j, n_ins)] if i < n_ins else slot_mapping[:0],
+            positions[i:j],
+            cos_sin_cache,
+            eps,
+            bs,
+        )
+
+
+def assert_close_chunked(actual, expected, *, rtol, atol):
+    """Compare along dim 0 in slices.
+
+    `assert_close` allocates several temporaries the size of its inputs --
+    `torch.isclose` alone needs a boolean mask over every element -- so at
+    131072 x 128 it asks for 12GiB with ~54GiB already held by the inputs and the
+    reference, and it is the *comparison* that runs out of memory rather than
+    anything under test. Slicing is equivalent and bounds that cost.
+    """
+    n = actual.shape[0]
+    per_row = max(1, actual.numel() // max(1, n))
+    step = max(1, _REF_MAX_ELEMS // per_row)
+    if step >= n:
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+        return
+    for i in range(0, n, step):
+        j = min(i + step, n)
+        torch.testing.assert_close(actual[i:j], expected[i:j], rtol=rtol, atol=atol)
+
+
 # ── Test 1: Q path numerical parity ──────────────────────────────────────────
 
 
@@ -376,7 +445,7 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int):
     positions_ref = positions.clone()
     cos_sin_cache_ref = cos_sin_cache.clone()
 
-    ref_impl(
+    ref_impl_chunked(
         q_ref,
         kv_ref,
         k_cache_ref,
@@ -389,7 +458,7 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int):
 
     fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs)
 
-    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+    assert_close_chunked(q, q_ref, rtol=1e-2, atol=1e-2)
 
 
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────
@@ -433,7 +502,7 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     cos_sin_cache_ref = cos_sin_cache.clone()
     slot_mapping_ref = slot_mapping.clone()
 
-    ref_impl(
+    ref_impl_chunked(
         q_ref,
         kv_ref,
         k_cache_ref,
@@ -483,7 +552,7 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     cos_sin_cache_ref = cos_sin_cache.clone()
     slot_mapping_ref = slot_mapping.clone()
 
-    ref_impl(
+    ref_impl_chunked(
         q_ref,
         kv_ref,
         k_cache_ref,
@@ -536,7 +605,7 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
     slot_mapping_ref = slot_mapping.clone()
 
     try:
-        ref_impl(
+        ref_impl_chunked(
             q_ref,
             kv_ref,
             k_cache_ref,
@@ -568,7 +637,7 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
         )
     fused_impl(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size)
 
-    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+    assert_close_chunked(q, q_ref, rtol=1e-2, atol=1e-2)
     k_cache_compare(k_cache, k_cache_ref, block_size, rtol=1e-2, atol=1e-2)
 
 
