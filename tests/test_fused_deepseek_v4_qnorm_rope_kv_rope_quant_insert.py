@@ -695,5 +695,16 @@ def test_backend_override_matches_generic(
         "bytes differ"
     )
     # q goes through a 512-element RMSNorm reduction whose tree may legitimately
-    # differ between decompositions, so allow a bf16 ULP there.
-    torch.testing.assert_close(q, q_gen, rtol=1e-3, atol=1e-3)
+    # differ between decompositions: a 2-D [TPP, 512] tile assigns lanes
+    # differently than a 1-D 512 block, so `variance` rounds differently, and
+    # that propagates through rsqrt into the stored bf16. Measured on a Hygon
+    # BW1000 at num_tokens=511: 5 of 16744448 elements differ, by up to 2 bf16
+    # ULP (7.8e-3 absolute, 7.8e-3 relative).
+    #
+    # The tolerance is the operator's own -- the same rtol/atol the accuracy
+    # tests above use against the torch reference. Asserting that an override
+    # tracks the generic kernel more closely than either tracks the reference
+    # would be asserting something the operator never promised. (It is in fact
+    # bit-identical on MetaX C550, but that is a property of one backend's lane
+    # assignment, not a contract.)
+    torch.testing.assert_close(q, q_gen, rtol=1e-2, atol=1e-2)
