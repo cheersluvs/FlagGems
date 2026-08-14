@@ -678,6 +678,11 @@ _OVERRIDE_ACTIVE = (
 def test_backend_override_matches_reference(
     num_tokens: int, n_heads: int, block_size: int
 ):
+    # This compares against the torch reference, so it carries the reference's
+    # fp32 intermediates and needs the same budget check as the tests above. It
+    # did not when it compared two Triton kernels to each other, and skipping the
+    # check cost a CI failure on a shared card with little free memory.
+    _skip_if_reference_wont_fit(num_tokens, n_heads)
     torch.manual_seed(3)
     device = "cuda"
     eps = 1e-6
