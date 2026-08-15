@@ -3,6 +3,7 @@ import logging
 
 import torch
 import triton
+import triton.language as tl
 
 logger = logging.getLogger("flag_gems." + __name__)
 
@@ -30,6 +31,19 @@ _generic = importlib.import_module("flag_gems.ops.linalg_lstsq")
 # (_TARGET_TILE_BYTES for the panel kernel, _TARGET_STACK_ROWS for the reduce)
 # fit here today and their shapes all pass, and a backend override is not the
 # place to change configuration that has not been measured on the device.
+#
+# A SECOND fact, seen only in CI: that runner's Triton rejects float64 `tl.dot`
+# in its own frontend --
+#
+#     triton/language/semantic.py:1445
+#     AssertionError: Unsupported lhs dtype fp64
+#
+# -- which is a version-dependent allow-list in the Triton build, not a
+# property of the silicon: a local Hygon box with a different Triton runs the
+# same float64 tests through `tl.dot` and passes all 76. So `_wy_update` also
+# carries a float64 form written as P rank-1 updates, branching on the COMPUTE
+# constexpr so float32 keeps `tl.dot` untouched. It is the same kernel as the
+# Iluvatar override's, for the same reason.
 # ---------------------------------------------------------------------------
 
 
@@ -118,12 +132,108 @@ def _wy_cfg_hygon(dt):
     return _generic._WY_BLOCK_R, min(_generic._WY_BLOCK_R, 128), _bc(), 3
 
 
-# ---- apply, once, at import (a pure Python rebind; no device access) ----
+@triton.jit
+def _wy_update_hygon(
+    W_ptr,
+    T_ptr,
+    M,
+    NC,
+    J0,
+    PW,
+    swb,
+    swi,
+    swj,
+    sTb,
+    sTi,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    P: tl.constexpr,
+    COMPUTE: tl.constexpr,
+):
+    """trailing -= V @ (T^T @ (V^T @ trailing)), with float64 avoiding tl.dot.
+
+    Identical to the generic kernel except that each of the three contractions
+    has a float64 form written as P rank-1 updates, P being the panel width
+    (16) rather than a problem dimension -- so the loop is short and fully
+    unrolled, and no tile grows.
+    """
+    b = tl.program_id(0)
+    cb = tl.program_id(1)
+    wb = b * swb
+    kk = tl.arange(0, P)
+    piv = J0 + kk
+    cols = J0 + PW + cb * BLOCK_C + tl.arange(0, BLOCK_C)
+    cmask = cols < NC
+
+    # ---- pass 1: Wacc = V^T @ trailing   (P x BLOCK_C) ----
+    Wacc = tl.zeros((P, BLOCK_C), dtype=COMPUTE)
+    for rb in range(J0, M, BLOCK_R):
+        rows = rb + tl.arange(0, BLOCK_R)
+        rmask = rows < M
+        vo = wb + rows[:, None] * swi + piv[None, :] * swj
+        vm = rmask[:, None] & (kk[None, :] < PW)
+        Vb = tl.load(W_ptr + vo, mask=vm & (rows[:, None] > piv[None, :]), other=0.0)
+        Vb = tl.where((rows[:, None] == piv[None, :]) & vm, 1.0, Vb)
+        Vb = tl.where(rows[:, None] < piv[None, :], 0.0, Vb)
+        to = wb + rows[:, None] * swi + cols[None, :] * swj
+        Tb = tl.load(W_ptr + to, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        if COMPUTE == tl.float64:
+            for p in range(P):
+                sel = (kk == p).to(COMPUTE)
+                vp = tl.sum(Vb * sel[None, :], axis=1)
+                Wacc += sel[:, None] * tl.sum(vp[:, None] * Tb, axis=0)[None, :]
+        else:
+            Wacc += tl.dot(tl.trans(Vb), Tb, input_precision="ieee")
+
+    tl.debug_barrier()  # WAR: pass-1 reads before pass-2 overwrites
+
+    # ---- Y = T^T @ Wacc ----
+    tof = tl.load(
+        T_ptr + b * sTb + kk[:, None] * sTi + kk[None, :],
+        mask=(kk[:, None] < PW) & (kk[None, :] < PW),
+        other=0.0,
+    )
+    if COMPUTE == tl.float64:
+        Y = tl.zeros((P, BLOCK_C), dtype=COMPUTE)
+        for p in range(P):
+            sel = (kk == p).to(COMPUTE)
+            trow = tl.sum(tof * sel[:, None], axis=0)
+            wrow = tl.sum(Wacc * sel[:, None], axis=0)
+            Y += trow[:, None] * wrow[None, :]
+    else:
+        Y = tl.dot(tl.trans(tof), Wacc, input_precision="ieee")
+
+    # ---- pass 2: trailing -= V @ Y ----
+    for rb in range(J0, M, BLOCK_R):
+        rows = rb + tl.arange(0, BLOCK_R)
+        rmask = rows < M
+        vo = wb + rows[:, None] * swi + piv[None, :] * swj
+        vm = rmask[:, None] & (kk[None, :] < PW)
+        Vb = tl.load(W_ptr + vo, mask=vm & (rows[:, None] > piv[None, :]), other=0.0)
+        Vb = tl.where((rows[:, None] == piv[None, :]) & vm, 1.0, Vb)
+        Vb = tl.where(rows[:, None] < piv[None, :], 0.0, Vb)
+        to = wb + rows[:, None] * swi + cols[None, :] * swj
+        tm = rmask[:, None] & cmask[None, :]
+        Tb = tl.load(W_ptr + to, mask=tm, other=0.0)
+        if COMPUTE == tl.float64:
+            upd = tl.zeros((BLOCK_R, BLOCK_C), dtype=COMPUTE)
+            for p in range(P):
+                sel = (kk == p).to(COMPUTE)
+                vp = tl.sum(Vb * sel[None, :], axis=1)
+                yp = tl.sum(Y * sel[:, None], axis=0)
+                upd += vp[:, None] * yp[None, :]
+        else:
+            upd = tl.dot(Vb, Y, input_precision="ieee")
+        tl.store(W_ptr + to, Tb - upd, mask=tm)
+
+
+# ---- apply, once, at import (pure Python rebinds; no device access) ----
 _generic._wy_cfg = _wy_cfg_hygon
+_generic._wy_update = _wy_update_hygon
 
 
 def linalg_lstsq(A, b, rcond=None, driver=None):
-    """Hygon specialization: generic kernels, device-derived WY block width."""
+    """Hygon specialization: derived WY block width, float64 without tl.dot."""
     logger.debug("GEMS_HYGON LINALG_LSTSQ")
     _bc()  # derive the device-dependent config now, on a live context
     return _generic.linalg_lstsq(A, b, rcond=rcond, driver=driver)
