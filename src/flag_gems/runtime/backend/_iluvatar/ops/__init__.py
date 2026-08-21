@@ -27,10 +27,10 @@ from .diagonal_scatter import diagonal_scatter
 from .div import div_mode, div_mode_
 from .gcd_ import gcd_
 from .hadamard_transform import hadamard_transform
-from .linalg_lstsq import linalg_lstsq
 from .histc import histc
 from .index_select_backward import index_select_backward
 from .linalg_cholesky import linalg_cholesky
+from .linalg_lstsq import linalg_lstsq
 from .linalg_matrix_norm import linalg_matrix_norm
 from .linear import linear
 from .log_normal_ import log_normal_
@@ -83,10 +83,10 @@ __all__ = [
     "div_mode_",
     "gcd_",
     "hadamard_transform",
-    "linalg_lstsq",
     "histc",
     "index_select_backward",
     "linalg_cholesky",
+    "linalg_lstsq",
     "linalg_matrix_norm",
     "linear",
     "log_normal_",
