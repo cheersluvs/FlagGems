@@ -32,6 +32,10 @@ from .index_select_backward import index_select_backward
 from .linalg_cholesky import linalg_cholesky
 from .linalg_lstsq import linalg_lstsq
 from .linalg_matrix_norm import linalg_matrix_norm
+from .linalg_solve_triangular import (
+    linalg_solve_triangular,
+    linalg_solve_triangular_out,
+)
 from .linear import linear
 from .log_normal_ import log_normal_
 from .matmul_bf16 import matmul_bf16
@@ -89,6 +93,8 @@ __all__ = [
     "linalg_cholesky",
     "linalg_lstsq",
     "linalg_matrix_norm",
+    "linalg_solve_triangular",
+    "linalg_solve_triangular_out",
     "linear",
     "log_normal_",
     "matmul_bf16",
