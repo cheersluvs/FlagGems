@@ -570,11 +570,13 @@ def test_linalg_lstsq_complex_fallback():
     ref = torch.linalg.lstsq(A.cpu(), b.cpu(), driver="gels").solution
     with flag_gems.use_gems():
         res = torch.ops.aten.linalg_lstsq(A, b)
-    # Compare on the CPU. torch.allclose on complex tensors needs an elementwise
-    # complex abs, and Iluvatar's runtime compiler cannot build one:
-    # `[IXRTC] nvrtcCompileProgram failed ... abs_kernel<std::complex<float>>`.
-    # The comparison gains nothing from running on the device.
-    assert torch.allclose(res[0].cpu(), ref, atol=1e-4, rtol=1e-4)
+    # res is moved to the CPU explicitly, and that is load-bearing: comparing
+    # complex tensors needs an elementwise complex abs, which Iluvatar's runtime
+    # compiler cannot build (`[IXRTC] nvrtcCompileProgram failed ...
+    # abs_kernel<std::complex<float>>`). gems_assert_close leaves both operands
+    # where they are once either is on the CPU, so it would otherwise compare a
+    # device tensor against a host one.
+    utils.gems_assert_close(res[0].cpu(), ref, torch.complex64)
 
 
 @pytest.mark.linalg_lstsq
