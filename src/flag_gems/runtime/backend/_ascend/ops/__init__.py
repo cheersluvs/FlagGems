@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .adaptive_max_pool3d import adaptive_max_pool3d
 from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out
 from .all import all, all_dim, all_dims
 from .amax import amax
@@ -86,6 +87,7 @@ from .log_sigmoid_backward import log_sigmoid_backward, log_sigmoid_backward_out
 from .log_softmax import log_softmax, log_softmax_backward, log_softmax_out
 from .masked_fill import masked_fill, masked_fill_
 from .masked_scatter import masked_scatter, masked_scatter_
+from .masked_scatter_backward import masked_scatter_backward
 from .masked_select import masked_select
 from .matmul_bf16 import matmul_bf16
 from .matmul_int8 import matmul_int8
@@ -145,6 +147,7 @@ from .zeros_like import zeros_like
 __all__ = [
     "_unique2",
     "_upsample_bicubic2d_aa",
+    "adaptive_max_pool3d",
     "addmm",
     "addmm_dtype",
     "addmm_dtype_out",
@@ -242,6 +245,7 @@ __all__ = [
     "masked_fill_",
     "masked_scatter",
     "masked_scatter_",
+    "masked_scatter_backward",
     "masked_select",
     "matmul_bf16",
     "matmul_int8",
