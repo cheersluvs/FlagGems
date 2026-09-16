@@ -120,6 +120,7 @@ from .replication_pad2d_backward import (
 from .resolve_neg import resolve_neg
 from .rms_norm import rms_norm
 from .rms_norm_w8a16_int8 import rms_norm_w8a16_int8
+from .rnn_tanh import rnn_tanh, rnn_tanh_data
 from .scatter import scatter, scatter_
 from .scatter_add_ import scatter_add_
 from .select_backward import select_backward
@@ -134,6 +135,7 @@ from .threshold import threshold, threshold_backward
 from .triu import triu
 from .unique import _unique2
 from .unsafe_index import unsafe_index
+from .unsafe_index_put import unsafe_index_put
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from .upsample_linear1d_backward import upsample_linear1d_backward
 from .upsample_nearest2d import upsample_nearest2d
@@ -282,6 +284,8 @@ __all__ = [
     "resolve_neg",
     "rms_norm",
     "rms_norm_w8a16_int8",
+    "rnn_tanh",
+    "rnn_tanh_data",
     "scaled_dot_product_attention",
     "scaled_dot_product_attention_backward",
     "scaled_dot_product_attention_forward",
@@ -306,6 +310,7 @@ __all__ = [
     "threshold_backward",
     "triu",
     "unsafe_index",
+    "unsafe_index_put",
     "upsample_linear1d_backward",
     "upsample_nearest2d",
     "var_mean",
