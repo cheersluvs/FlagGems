@@ -77,6 +77,16 @@ def torch_ge(v):
     return version.parse(torch.__version__) >= version.parse(v)
 
 
+def torch_has_aten_overload(operator, overload):
+    """Return whether this backend's PyTorch build exposes an ATen overload."""
+    try:
+        packet = getattr(torch.ops.aten, operator)
+        getattr(packet, overload)
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
 _FULL_CONFIG = (
     ("__and__.Scalar", bitwise_and_scalar),
     ("__and__.Tensor", bitwise_and_tensor),
@@ -826,6 +836,9 @@ _FULL_CONFIG = (
     ("linalg_matrix_exp", linalg_matrix_exp),
     ("linalg_matrix_exp.out", linalg_matrix_exp_out),
     ("linalg_matrix_norm", linalg_matrix_norm),
+    ("linalg_matrix_norm.out", linalg_matrix_norm_out),
+    ("linalg_matrix_norm.str_ord", linalg_matrix_norm),
+    ("linalg_matrix_norm.str_ord_out", linalg_matrix_norm_out),
     ("linalg_matrix_power", linalg_matrix_power),
     ("linalg_matrix_power.out", linalg_matrix_power_out),
     ("linalg_matrix_rank", linalg_matrix_rank_tol),
@@ -951,6 +964,13 @@ _FULL_CONFIG = (
     ("mse_loss_backward", mse_loss_backward),
     ("mul.Tensor", mul),
     ("mul_.Tensor", mul_),
+    ("multi_margin_loss", multi_margin_loss),
+    ("multi_margin_loss.out", multi_margin_loss_out),
+    ("multi_margin_loss_backward", multi_margin_loss_backward),
+    (
+        "multi_margin_loss_backward.grad_input",
+        multi_margin_loss_backward_out,
+    ),
     ("multinomial", multinomial),
     ("multiply", multiply),
     ("multiply.Scalar", multiply),
@@ -1022,6 +1042,7 @@ _FULL_CONFIG = (
     ("ormqr", ormqr),
     ("outer", outer),
     ("pad", pad),
+    ("pad_sequence", pad_sequence),
     ("pairwise_distance", pairwise_distance),
     ("pdist", pdist),
     ("permute_copy", permute_copy),
@@ -1192,6 +1213,7 @@ _FULL_CONFIG = (
     ("special_erfinv.out", special_erfinv_out),
     ("special_exp2", special_exp2),
     ("special_expit", special_expit),
+    ("special_expm1", special_expm1),
     ("special_gammainc", special_gammainc),
     ("special_gammaincc", special_gammaincc),
     ("special_gammaincc.out", igammac_out),
@@ -1205,6 +1227,18 @@ _FULL_CONFIG = (
     ("special_i1.out", special_i1_out),
     ("special_i1e", special_i1e),
     ("special_i1e.out", special_i1e_out),
+    ("special_laguerre_polynomial_l", special_laguerre_polynomial_l),
+    ("special_laguerre_polynomial_l.n_scalar", special_laguerre_polynomial_l),
+    (
+        "special_laguerre_polynomial_l.n_scalar_out",
+        special_laguerre_polynomial_l_out,
+    ),
+    ("special_laguerre_polynomial_l.out", special_laguerre_polynomial_l_out),
+    ("special_laguerre_polynomial_l.x_scalar", special_laguerre_polynomial_l),
+    (
+        "special_laguerre_polynomial_l.x_scalar_out",
+        special_laguerre_polynomial_l_out,
+    ),
     ("special_legendre_polynomial_p", special_legendre_polynomial_p),
     ("special_log1p", special_log1p),
     ("special_log1p.out", special_log1p_out),
@@ -1234,6 +1268,12 @@ _FULL_CONFIG = (
     ("special_softmax", special_softmax),
     ("special_xlog1py", special_xlog1py),
     ("special_xlogy", special_xlogy),
+    ("special_zeta", special_zeta),
+    ("special_zeta.other_scalar", special_zeta_tensor_scalar),
+    ("special_zeta.other_scalar_out", special_zeta_tensor_scalar_out),
+    ("special_zeta.out", special_zeta_out),
+    ("special_zeta.self_scalar", special_zeta_scalar_tensor),
+    ("special_zeta.self_scalar_out", special_zeta_scalar_tensor_out),
     ("split_with_sizes", split_with_sizes),
     ("split_with_sizes_copy", split_with_sizes_copy),
     ("sqrt", sqrt),
@@ -1244,6 +1284,36 @@ _FULL_CONFIG = (
     ("squeeze_copy", squeeze_copy),
     ("stack", stack),
     ("std.correction", std),
+    (
+        "std_mean",
+        std_mean,
+        lambda: torch_has_aten_overload("std_mean", "default"),
+    ),
+    (
+        "std_mean.correction",
+        std_mean_correction,
+        lambda: torch_has_aten_overload("std_mean", "correction"),
+    ),
+    (
+        "std_mean.correction_names",
+        std_mean_correction_names,
+        lambda: torch_has_aten_overload("std_mean", "correction_names"),
+    ),
+    (
+        "std_mean.correction_out",
+        std_mean_correction_out,
+        lambda: torch_has_aten_overload("std_mean", "correction_out"),
+    ),
+    (
+        "std_mean.dim",
+        std_mean_dim,
+        lambda: torch_has_aten_overload("std_mean", "dim"),
+    ),
+    (
+        "std_mean.names_dim",
+        std_mean_names_dim,
+        lambda: torch_has_aten_overload("std_mean", "names_dim"),
+    ),
     ("sub.Tensor", sub),
     ("sub_.Tensor", sub_),
     ("subtract.Tensor", subtract),
@@ -1275,6 +1345,7 @@ _FULL_CONFIG = (
     ("tile", tile),
     ("topk", topk),
     ("trace", trace),
+    ("trace_backward", trace_backward),
     ("transpose.int", transpose),
     ("tril", tril),
     ("tril.out", tril_out),

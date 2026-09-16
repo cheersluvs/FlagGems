@@ -69,6 +69,7 @@ from .linalg_lu import linalg_lu, linalg_lu_out
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linalg_matrix_exp import linalg_matrix_exp, linalg_matrix_exp_out
+from .linalg_matrix_norm import linalg_matrix_norm, linalg_matrix_norm_out
 from .linalg_matrix_power import linalg_matrix_power, linalg_matrix_power_out
 from .linalg_matrix_rank import (
     linalg_matrix_rank,
@@ -101,6 +102,7 @@ from .nonzero_static import nonzero_static, nonzero_static_out
 from .ones import ones
 from .ones_like import ones_like
 from .outer import outer
+from .pad_sequence import pad_sequence
 from .pairwise_distance import pairwise_distance
 from .polar import polar
 from .polygamma import polygamma_
@@ -226,6 +228,8 @@ __all__ = [
     "linalg_lu_out",
     "linalg_matrix_exp",
     "linalg_matrix_exp_out",
+    "linalg_matrix_norm",
+    "linalg_matrix_norm_out",
     "linalg_matrix_power",
     "linalg_matrix_power_out",
     "linalg_matrix_rank",
@@ -269,6 +273,7 @@ __all__ = [
     "ones",
     "ones_like",
     "outer",
+    "pad_sequence",
     "pairwise_distance",
     "polar",
     "polygamma_",
