@@ -126,27 +126,40 @@ class _Ref:
         self.residuals = residuals
 
 
-def _cpu_ref(A, b, driver="gels"):
-    """gels reference solved on the CPU, returned where the device expects it.
+# Backends whose own lstsq cannot serve as the reference for the tests below.
+# Iluvatar's cuSOLVER shim has no float64 QR, so a solve on the device raises
+# `cusolver error ... cusolverDnDormqr_bufferSize` and the test fails on the
+# REFERENCE rather than on the operator. Everywhere else the device solve is
+# what this file has always used and what CI has always run, so it stays the
+# default -- the CPU detour costs a full float64 host solve per case.
+_REF_ON_CPU = flag_gems.vendor_name == "iluvatar"
 
-    The tests below that build their own reference used to call
-    `torch.linalg.lstsq` on the DEVICE tensors, which runs the vendor's kernel
-    rather than a trusted one. On Iluvatar that raises outright --
-    `cusolver error ... cusolverDnDormqr_bufferSize` -- because its cuSOLVER
-    shim has no float64 QR, so the test failed on the reference rather than on
-    the operator. Solve on the CPU instead: same answer on every backend.
+
+def _cpu_ref(A, b, driver="gels"):
+    """gels reference, returned where the device expects it.
+
+    Solved with the device's own torch, except on the backends in
+    `_REF_ON_CPU` (see above), where it is solved on the CPU in float64
+    instead. Both give the same answer; only the one that runs is different.
 
     Only `solution` and `residuals` are carried, which is all the callers use;
     the one test that also needs `rank` and `singular_values` keeps torch on
     the device, since it is asserting torch's tuple contract rather than
     numbers.
     """
-    out = torch.linalg.lstsq(
-        A.detach().cpu().to(torch.float64),
-        b.detach().cpu().to(torch.float64),
-        driver=driver,
-    )
-    ref_dt = torch.float64 if utils.fp64_is_supported else torch.float32
+    if _REF_ON_CPU:
+        out = torch.linalg.lstsq(
+            A.detach().cpu().to(torch.float64),
+            b.detach().cpu().to(torch.float64),
+            driver=driver,
+        )
+        ref_dt = torch.float64 if utils.fp64_is_supported else torch.float32
+    else:
+        out = torch.linalg.lstsq(A, b, driver=driver)
+        ref_dt = out.solution.dtype
+    # Placement is shared by both branches: under `--ref=cpu` (TO_CPU) the
+    # callers' helpers move `res` to the CPU and expect the reference to be
+    # there already, otherwise they compare on the device.
     dev = torch.device("cpu") if utils.TO_CPU else A.device
     return _Ref(
         out.solution.to(device=dev, dtype=ref_dt),
