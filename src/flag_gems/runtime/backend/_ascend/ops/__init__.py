@@ -50,6 +50,7 @@ from .flip import flip
 from .full import full
 from .full_like import full_like
 from .gather import gather, gather_backward
+from .grouped_matmul import grouped_matmul
 from .groupnorm import group_norm, group_norm_backward
 from .gru import gru, gru_data
 from .hadamard_transform import hadamard_transform
@@ -125,6 +126,7 @@ from .rms_norm_w8a16_int8 import rms_norm_w8a16_int8
 from .rnn_tanh import rnn_tanh, rnn_tanh_data
 from .scatter import scatter, scatter_
 from .scatter_add_ import scatter_add_
+from .scatter_reduce import scatter_reduce, scatter_reduce_, scatter_reduce_out
 from .select_backward import select_backward
 from .select_scatter import select_scatter
 from .silu import silu, silu_
@@ -199,6 +201,7 @@ __all__ = [
     "gather_backward",
     "group_norm",
     "group_norm_backward",
+    "grouped_matmul",
     "gru",
     "gru_data",
     "hadamard_transform",
@@ -298,6 +301,9 @@ __all__ = [
     "scatter",
     "scatter_",
     "scatter_add_",
+    "scatter_reduce",
+    "scatter_reduce_",
+    "scatter_reduce_out",
     "select_backward",
     "select_scatter",
     "silu",
