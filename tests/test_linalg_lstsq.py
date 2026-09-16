@@ -126,13 +126,24 @@ class _Ref:
         self.residuals = residuals
 
 
-# Backends whose own lstsq cannot serve as the reference for the tests below.
-# Iluvatar's cuSOLVER shim has no float64 QR, so a solve on the device raises
-# `cusolver error ... cusolverDnDormqr_bufferSize` and the test fails on the
-# REFERENCE rather than on the operator. Everywhere else the device solve is
-# what this file has always used and what CI has always run, so it stays the
-# default -- the CPU detour costs a full float64 host solve per case.
-_REF_ON_CPU = flag_gems.vendor_name == "iluvatar"
+# Backends whose own lstsq cannot serve as the reference for the tests below,
+# because the device solve fails on the REFERENCE rather than on the operator:
+#
+#   iluvatar  its cuSOLVER shim has no float64 QR, so the solve raises
+#             `cusolver error ... cusolverDnDormqr_bufferSize`.
+#   hygon     its torch refuses underdetermined systems outright -- "only
+#             overdetermined systems (input.size(-2) >= input.size(-1)) are
+#             allowed on CUDA. Please rebuild with cuSOLVER" -- which is exactly
+#             what the min-norm cases below are.
+#
+# The Hygon entry tracks the TORCH BUILD, not the hardware: a BW1000 development
+# box solves these cases on the device without complaint, while the Hygon CI
+# image raises. CI is the binding one.
+#
+# Everywhere else the device solve is what this file has always used and what CI
+# has always run, so it stays the default -- the CPU detour costs a full float64
+# host solve per case.
+_REF_ON_CPU = flag_gems.vendor_name in ("hygon", "iluvatar")
 
 
 def _cpu_ref(A, b, driver="gels"):
